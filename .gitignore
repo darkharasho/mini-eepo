@@ -1,8 +1,14 @@
-node_modules
+# Build output
+bin/
+obj/
+
+# Rider / VS
+.idea/
+.vs/
+*.user
+
+# Environment
 .env
-.env.*
-.DS_Store
-dist
-build
-*.log
+
+# Superpowers
 .superpowers
