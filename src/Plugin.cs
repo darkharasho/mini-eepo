@@ -12,7 +12,7 @@ using UnityEngine;
 
 namespace MiniEepo
 {
-    [BepInPlugin("darkharasho.MiniEepo", "MiniEepo", "1.1.0")]
+    [BepInPlugin(PluginInfo.PLUGIN_GUID, PluginInfo.PLUGIN_NAME, PluginInfo.PLUGIN_VERSION)]
     [BepInDependency("Vippy.ScalerCore", BepInDependency.DependencyFlags.HardDependency)]
     public class Plugin : BaseUnityPlugin
     {
@@ -68,7 +68,7 @@ namespace MiniEepo
             else
                 Log.LogWarning("SetVoicePitchRPC not found — voice mod toggle disabled");
 
-            Log.LogInfo("MiniEepo v1.1.0 loaded — everything is tiny now.");
+            Log.LogInfo($"MiniEepo v{PluginInfo.PLUGIN_VERSION} loaded — everything is tiny now.");
         }
 
         internal static void ResetToLocalConfig()
