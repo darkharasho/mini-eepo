@@ -18,7 +18,7 @@ Config file: `BepInEx/config/darkharasho.MiniEepo.cfg`
 
 ## Building
 
-Requires the .NET SDK and a R.E.P.O. install with BepInEx and ScalerCore.
+Requires the [.NET SDK](https://dotnet.microsoft.com/download) and a R.E.P.O. install (for game DLLs). BepInEx and ScalerCore are pulled automatically via NuGet/libs — no separate install needed to compile.
 
 **Windows:**
 ```bash
@@ -27,11 +27,11 @@ dotnet build MiniEepo.csproj --configuration Release
 dotnet build MiniEepo.csproj --configuration Release /p:GameDir="D:\Games\REPO"
 ```
 
-**Linux (Steam/Proton):**
+**Linux (Steam):**
 ```bash
 ./package.sh
 # Override game path:
-GAME_DIR="$HOME/.steam/steam/steamapps/common/REPO" ./package.sh
+GAME_DIR="/path/to/steamapps/common/REPO" ./package.sh
 ```
 
 Output DLL: `bin/Release/netstandard2.1/MiniEepo.dll`

@@ -5,7 +5,9 @@ VERSION="1.0.0"
 DLL="bin/Release/netstandard2.1/MiniEepo.dll"
 OUT="MiniEepo-${VERSION}.zip"
 
-# Resolve game directory: env var > common Steam locations
+# Resolve game directory for game DLLs (Assembly-CSharp, UnityEngine).
+# BepInEx and ScalerCore are handled via NuGet/libs, so GameDir is only
+# needed for the REPO_Data/Managed assemblies.
 if [ -z "${GAME_DIR:-}" ]; then
     for candidate in \
         "$HOME/.steam/steam/steamapps/common/REPO" \
