@@ -9,34 +9,42 @@
     <Nullable>enable</Nullable>
   </PropertyGroup>
 
-  <!-- Override GameDir via env var or MSBuild property for CI/non-default installs -->
+  <!-- Override GameDir via env var or MSBuild property: dotnet build /p:GameDir="/path/to/REPO" -->
   <PropertyGroup Condition="'$(GameDir)' == ''">
     <GameDir>C:\Program Files (x86)\Steam\steamapps\common\REPO</GameDir>
   </PropertyGroup>
   <PropertyGroup>
-    <BepInExDir>$(GameDir)\BepInEx</BepInExDir>
-    <ManagedDir>$(GameDir)\REPO_Data\Managed</ManagedDir>
+    <ManagedDir>$(GameDir)/REPO_Data/Managed</ManagedDir>
   </PropertyGroup>
 
+  <!-- BepInEx and Harmony from NuGet — no game install required for compilation -->
   <ItemGroup>
-    <Reference Include="BepInEx">
-      <HintPath>$(BepInExDir)\core\BepInEx.dll</HintPath>
-      <Private>false</Private>
-    </Reference>
-    <Reference Include="0Harmony">
-      <HintPath>$(BepInExDir)\core\0Harmony.dll</HintPath>
+    <PackageReference Include="BepInEx.Core" Version="5.4.21.0">
+      <ExcludeAssets>runtime</ExcludeAssets>
+    </PackageReference>
+    <PackageReference Include="BepInEx.PluginInfoProps" Version="1.1.0" />
+  </ItemGroup>
+
+  <!-- Game DLLs — must be present in the game directory -->
+  <ItemGroup>
+    <Reference Include="UnityEngine">
+      <HintPath>$(ManagedDir)/UnityEngine.dll</HintPath>
       <Private>false</Private>
     </Reference>
     <Reference Include="UnityEngine.CoreModule">
-      <HintPath>$(ManagedDir)\UnityEngine.CoreModule.dll</HintPath>
+      <HintPath>$(ManagedDir)/UnityEngine.CoreModule.dll</HintPath>
       <Private>false</Private>
     </Reference>
     <Reference Include="Assembly-CSharp">
-      <HintPath>$(ManagedDir)\Assembly-CSharp.dll</HintPath>
+      <HintPath>$(ManagedDir)/Assembly-CSharp.dll</HintPath>
       <Private>false</Private>
     </Reference>
+  </ItemGroup>
+
+  <!-- ScalerCore — vendored from Thunderstore v0.4.3, not copied to output -->
+  <ItemGroup>
     <Reference Include="ScalerCore">
-      <HintPath>$(BepInExDir)\plugins\ScalerCore\ScalerCore.dll</HintPath>
+      <HintPath>libs/ScalerCore.dll</HintPath>
       <Private>false</Private>
     </Reference>
   </ItemGroup>
