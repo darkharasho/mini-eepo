@@ -50,10 +50,10 @@ namespace MiniEepo
             Plugin.Shrink(__instance.gameObject, Plugin.PlayerScale.Value);
     }
 
-    [HarmonyPatch(typeof(ItemAttributes), "Start")]
-    internal static class ItemAttributesPatch
+    [HarmonyPatch(typeof(PhysGrabObject), "Start")]
+    internal static class PhysGrabObjectPatch
     {
-        private static void Postfix(ItemAttributes __instance) =>
+        private static void Postfix(PhysGrabObject __instance) =>
             Plugin.Shrink(__instance.gameObject, Plugin.ItemScale.Value);
     }
 
