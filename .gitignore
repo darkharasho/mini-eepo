@@ -10,5 +10,8 @@ obj/
 # Environment
 .env
 
+# Thunderstore (icon.png must be user-supplied, not versioned)
+*.png
+
 # Superpowers
 .superpowers
