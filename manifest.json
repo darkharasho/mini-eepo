@@ -1,0 +1,10 @@
+{
+    "name": "MiniEepo",
+    "version_number": "1.0.0",
+    "website_url": "https://github.com/darkharasho/mini-eepo",
+    "description": "Shrinks all players, items, and valuables to 40% size. Everyone starts the round tiny.",
+    "dependencies": [
+        "BepInEx-BepInExPack-5.4.2100",
+        "Vippy-ScalerCore-0.4.3"
+    ]
+}
