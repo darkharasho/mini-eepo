@@ -34,7 +34,7 @@ namespace MiniEepo
 
         internal static void Shrink(GameObject go)
         {
-            var opts = ScaleOptions.Default;
+            var opts = ScaleOptions.Default; // ScaleOptions is a struct; this is a safe value copy
             opts.Factor = ScaleFactor.Value;
             ScaleManager.ApplyIfNotScaled(go, opts);
         }
