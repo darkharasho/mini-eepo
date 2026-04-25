@@ -12,7 +12,9 @@ A R.E.P.O. mod that shrinks all players, items, and valuables to 40% of their or
 
 | Key | Default | Range | Description |
 |-----|---------|-------|-------------|
-| `ScaleFactor` | `0.4` | `0.1–1.0` | Size multiplier for all shrinkable objects |
+| `PlayerScale` | `0.4` | `0.1–1.0` | Size multiplier for players |
+| `ItemScale` | `0.4` | `0.1–1.0` | Size multiplier for items |
+| `ValuableScale` | `0.4` | `0.1–1.0` | Size multiplier for valuables |
 
 Config file: `BepInEx/config/darkharasho.MiniEepo.cfg`
 
