@@ -43,6 +43,6 @@ Outputs `MiniEepo-<version>.zip` ready for Thunderstore upload.
 
 ## Releasing
 
-1. Bump `version_number` in `manifest.json` and `VERSION` in `package.sh`
+1. Bump `version_number` in `manifest.json` (`package.sh` reads it automatically)
 2. Run `./package.sh` to build and package
 3. Upload the zip to [Thunderstore](https://thunderstore.io/c/repo/) — each release requires a new version number

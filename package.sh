@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-VERSION="1.0.0"
+VERSION="$(python3 -c "import json; print(json.load(open('manifest.json'))['version_number'])")"
 DLL="bin/Release/netstandard2.1/MiniEepo.dll"
 OUT="MiniEepo-${VERSION}.zip"
 R2_PROFILE="${R2_PROFILE:-10-30-update}"
