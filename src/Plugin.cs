@@ -80,8 +80,11 @@ namespace MiniEepo
             ActiveVoiceMod      = VoiceMod.Value;
         }
 
+        internal static readonly HashSet<int> ManagedObjects = new HashSet<int>();
+
         internal static void Shrink(GameObject go, float factor)
         {
+            ManagedObjects.Add(go.GetInstanceID());
             var opts = ScaleOptions.Default; // ScaleOptions is a struct; this is a safe value copy
             opts.Factor = factor;
             ScaleManager.ApplyIfNotScaled(go, opts);
@@ -214,20 +217,36 @@ namespace MiniEepo
         }
     }
 
+    // Block external mods (e.g. ShrinkerGun) from toggling/restoring MiniEepo-managed objects.
+    // ScalerCore's "same factor → toggle" would otherwise unshrink players and items when shot.
+    [HarmonyPatch(typeof(ScaleManager), "Apply", typeof(GameObject), typeof(ScaleOptions))]
+    internal static class ScaleManagerApplyPatch
+    {
+        static bool Prefix(GameObject target)
+        {
+            var ctrl = ScaleManager.GetController(target);
+            int id = ctrl != null ? ctrl.gameObject.GetInstanceID() : target.GetInstanceID();
+            return !Plugin.ManagedObjects.Contains(id);
+        }
+    }
+
     internal class ValuableCartTracker : MonoBehaviour
     {
         private ValuableObject? _vo;
         private bool _inCart;
         private Vector3 _preCartScale;
 
-        internal void SetValuable(ValuableObject vo) => _vo = vo;
+        internal void SetValuable(ValuableObject vo)
+        {
+            _vo = vo;
+            _preCartScale = vo.transform.localScale; // capture once — never overwrite mid-lerp
+        }
 
         private void OnTriggerEnter(Collider other)
         {
             if (_inCart || _vo == null) return;
             if (other.GetComponentInParent<PhysGrabInCart>() == null) return;
             _inCart = true;
-            _preCartScale = _vo.transform.localScale;
             StopAllCoroutines();
             StartCoroutine(ScaleTo(_vo.transform.localScale * Plugin.ActiveCartScale, 0.4f));
         }
