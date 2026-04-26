@@ -57,16 +57,47 @@ namespace MiniEepo
             var harmony = new Harmony("darkharasho.MiniEepo");
             harmony.PatchAll();
 
-            // SetVoicePitchRPC may have overloads — find it manually so a missing
-            // match can't abort PatchAll for the rest of the mod.
-            var voiceMethod = AccessTools.Method(typeof(PlayerAvatar), "SetVoicePitchRPC",
-                new[] { typeof(float) });
-            voiceMethod ??= AccessTools.Method(typeof(PlayerAvatar), "SetVoicePitchRPC");
-            if (voiceMethod != null)
-                harmony.Patch(voiceMethod,
-                    prefix: new HarmonyMethod(typeof(VoicePitchPatch), nameof(VoicePitchPatch.Prefix)));
-            else
-                Log.LogWarning("SetVoicePitchRPC not found — voice mod toggle disabled");
+            // ScalerCore modulates voice pitch internally via AudioPitchHelper.OverridePitch —
+            // that is what produces the mini voice, not SetVoicePitchRPC.
+            // Patch OverridePitch and skip it entirely when VoiceMod is off.
+            bool voicePatched = false;
+            var apType = AccessTools.TypeByName("ScalerCore.AudioPitchHelper");
+            if (apType != null)
+            {
+                var m = AccessTools.Method(apType, "OverridePitch");
+                if (m != null)
+                {
+                    harmony.Patch(m, prefix: new HarmonyMethod(typeof(VoicePitchPatch), nameof(VoicePitchPatch.Prefix)));
+                    Log.LogInfo("[Voice] Patched ScalerCore.AudioPitchHelper.OverridePitch");
+                    voicePatched = true;
+                }
+            }
+            if (!voicePatched)
+                Log.LogWarning("[Voice] AudioPitchHelper.OverridePitch not found — voice mod toggle disabled");
+
+            // Cart scaling — patch whichever lifecycle method PhysGrabInCart defines.
+            // Kept separate from PhysGrabObjectPatch to avoid any interference with item scaling.
+            bool cartPatched = false;
+            foreach (var lifecycle in new[] { "Start", "Awake", "OnEnable" })
+            {
+                var m = AccessTools.Method(typeof(PhysGrabInCart), lifecycle);
+                if (m == null) continue;
+                harmony.Patch(m, postfix: new HarmonyMethod(typeof(CartPatch), nameof(CartPatch.Postfix)));
+                Log.LogInfo($"[Cart] Patched PhysGrabInCart.{lifecycle}");
+                cartPatched = true;
+                break;
+            }
+            if (!cartPatched)
+                Log.LogWarning("PhysGrabInCart lifecycle method not found — cart will not be scaled");
+
+            // Revive/get-up resets localScale — re-shrink after recovery.
+            foreach (var reviveName in new[] { "ReviveRPC", "Revive", "RevivedRPC", "GetUp", "GetUpRPC" })
+            {
+                var m = AccessTools.Method(typeof(PlayerAvatar), reviveName);
+                if (m == null) continue;
+                harmony.Patch(m, postfix: new HarmonyMethod(typeof(PlayerRevivePatch), nameof(PlayerRevivePatch.Postfix)));
+                Log.LogInfo($"[Revive] Patched {reviveName}");
+            }
 
             Log.LogInfo($"MiniEepo v{PluginInfo.PLUGIN_VERSION} loaded — everything is tiny now.");
         }
@@ -88,6 +119,18 @@ namespace MiniEepo
             var opts = ScaleOptions.Default; // ScaleOptions is a struct; this is a safe value copy
             opts.Factor = factor;
             ScaleManager.ApplyIfNotScaled(go, opts);
+        }
+
+        // Like Shrink, but clears ScalerCore's internal state first so it re-applies even if
+        // the game reset localScale externally (e.g. after revive/damage recovery).
+        internal static void ForceShrink(GameObject go, float factor)
+        {
+            ManagedObjects.Remove(go.GetInstanceID());
+            var ctrl = ScaleManager.GetController(go);
+            // DestroyImmediate so ApplyIfNotScaled sees a fresh object this same frame.
+            if (ctrl != null && ctrl is UnityEngine.Component comp)
+                UnityEngine.Object.DestroyImmediate(comp);
+            Shrink(go, factor);
         }
     }
 
@@ -130,6 +173,7 @@ namespace MiniEepo
             {
                 var props = PhotonNetwork.CurrentRoom?.CustomProperties;
                 if (props != null) OnRoomPropertiesUpdate(props);
+                StartCoroutine(RescaleAfterJoin());
             }
         }
 
@@ -157,6 +201,24 @@ namespace MiniEepo
 
         // Singleplayer / lobby: reset to local config
         public override void OnLeftRoom() => Plugin.ResetToLocalConfig();
+
+        // After joining as non-host, items may have already spawned before sync arrived.
+        // Re-scale everything once Photon settles.
+        private IEnumerator RescaleAfterJoin()
+        {
+            yield return new WaitForSeconds(1f);
+            foreach (var pgo in FindObjectsOfType<PhysGrabObject>())
+            {
+                var attrs = pgo.GetComponentInParent<ItemAttributes>(includeInactive: true)
+                         ?? pgo.GetComponentInChildren<ItemAttributes>(includeInactive: true);
+                if (attrs != null)
+                    Plugin.ForceShrink(attrs.gameObject, Plugin.ActiveItemScale);
+            }
+            foreach (var vo in FindObjectsOfType<ValuableObject>())
+                Plugin.ForceShrink(vo.gameObject, Plugin.ActiveValuableScale);
+            foreach (var pa in FindObjectsOfType<PlayerAvatar>())
+                Plugin.ForceShrink(pa.gameObject, Plugin.ActivePlayerScale);
+        }
     }
 
     [HarmonyPatch(typeof(PlayerAvatar), "Start")]
@@ -177,10 +239,17 @@ namespace MiniEepo
     {
         private static void Postfix(PhysGrabObject __instance)
         {
-            // Only scale grabbable items, not level geometry (doors, chest lids, etc.)
-            var attrs = __instance.GetComponentInParent<ItemAttributes>(includeInactive: true);
-            if (attrs != null)
-                Plugin.Shrink(attrs.gameObject, Plugin.ActiveItemScale);
+            // ItemAttributes above the PhysGrabObject — original hierarchy; scale from that root.
+            var attrsAbove = __instance.GetComponentInParent<ItemAttributes>(includeInactive: true);
+            if (attrsAbove != null)
+            {
+                Plugin.Shrink(attrsAbove.gameObject, Plugin.ActiveItemScale);
+                return;
+            }
+            // ItemAttributes below (child) — game update may have moved it; scale from here.
+            var attrsBelow = __instance.GetComponentInChildren<ItemAttributes>(includeInactive: true);
+            if (attrsBelow != null)
+                Plugin.Shrink(__instance.gameObject, Plugin.ActiveItemScale);
         }
     }
 
@@ -207,13 +276,35 @@ namespace MiniEepo
         }
     }
 
-    // Applied manually in Plugin.Awake to avoid PatchAll aborting on overload ambiguity
+    // Applied manually in Plugin.Awake.
+    // Returning false skips ScalerCore's OverridePitch entirely, keeping pitch at 1.0.
     internal static class VoicePitchPatch
     {
-        internal static void Prefix(ref float __0)
+        internal static bool Prefix() => Plugin.ActiveVoiceMod;
+    }
+
+    // Applied manually in Plugin.Awake for each candidate revive method name.
+    // Revive/get-up animations in REPO reset transform.localScale; ForceShrink clears
+    // ScalerCore's internal state so the scale is re-applied correctly.
+    internal static class PlayerRevivePatch
+    {
+        internal static void Postfix(PlayerAvatar __instance)
         {
-            if (!Plugin.ActiveVoiceMod)
-                __0 = 1.0f;
+            Plugin.ForceShrink(__instance.gameObject, Plugin.ActivePlayerScale);
+        }
+    }
+
+    // Applied manually in Plugin.Awake — scales the cart to match item/player scale.
+    // PhysGrabInCart is the trigger-zone component on the cart; its lifecycle method
+    // fires after the cart is fully initialised in the scene.
+    internal static class CartPatch
+    {
+        internal static void Postfix(PhysGrabInCart __instance)
+        {
+            // Walk up to the PhysGrabObject (the physics root of the cart), fall back to transform.root.
+            var pgo = __instance.GetComponentInParent<PhysGrabObject>(includeInactive: true);
+            var root = pgo != null ? pgo.gameObject : __instance.transform.root.gameObject;
+            Plugin.Shrink(root, Plugin.ActiveItemScale);
         }
     }
 
