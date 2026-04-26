@@ -9,6 +9,7 @@ using Photon.Pun;
 using Photon.Realtime;
 using ScalerCore;
 using UnityEngine;
+using UnityEngine.SceneManagement;
 
 namespace MiniEepo
 {
@@ -50,53 +51,49 @@ namespace MiniEepo
 
             ResetToLocalConfig();
 
-            var go = new GameObject("MiniEepo_Syncer");
-            Object.DontDestroyOnLoad(go);
-            go.AddComponent<SettingsSyncer>();
+            // Attach SettingsSyncer to our own plugin GameObject (BepInEx keeps it alive across
+            // scenes). A fresh GameObject didn't reliably get its Start callback fired.
+            gameObject.AddComponent<SettingsSyncer>();
 
             var harmony = new Harmony("darkharasho.MiniEepo");
             harmony.PatchAll();
 
-            // ScalerCore modulates voice pitch internally via AudioPitchHelper.OverridePitch —
-            // that is what produces the mini voice, not SetVoicePitchRPC.
-            // Patch OverridePitch and skip it entirely when VoiceMod is off.
-            bool voicePatched = false;
-            var apType = AccessTools.TypeByName("ScalerCore.AudioPitchHelper");
-            if (apType != null)
+            // Voice mod: patch ScalerCore's AudioPitchHelper.ApplyPitch — return false from prefix
+            // when VoiceMod is off, suppressing the pitch change at its source. More reliable than
+            // racing to reset AudioSource.pitch after the fact (which only catches looping sounds,
+            // not one-shots).
+            System.Type? pitchHelper = null;
+            foreach (var asm in System.AppDomain.CurrentDomain.GetAssemblies())
             {
-                var m = AccessTools.Method(apType, "OverridePitch");
-                if (m != null)
+                if (asm.GetName().Name != "ScalerCore") continue;
+                foreach (var t in asm.GetTypes())
+                    if (t.Name == "AudioPitchHelper") { pitchHelper = t; break; }
+                if (pitchHelper != null) break;
+            }
+            if (pitchHelper != null)
+            {
+                var applyPitch = AccessTools.Method(pitchHelper, "ApplyPitch");
+                if (applyPitch != null)
                 {
-                    harmony.Patch(m, prefix: new HarmonyMethod(typeof(VoicePitchPatch), nameof(VoicePitchPatch.Prefix)));
-                    Log.LogInfo("[Voice] Patched ScalerCore.AudioPitchHelper.OverridePitch");
-                    voicePatched = true;
+                    harmony.Patch(applyPitch, prefix: new HarmonyMethod(typeof(VoicePitchPatch), nameof(VoicePitchPatch.Prefix)));
+                    Log.LogInfo($"[Voice] Patched {pitchHelper.FullName}.ApplyPitch");
                 }
+                else
+                    Log.LogWarning($"[Voice] {pitchHelper.FullName}.ApplyPitch not found");
             }
-            if (!voicePatched)
-                Log.LogWarning("[Voice] AudioPitchHelper.OverridePitch not found — voice mod toggle disabled");
+            else
+                Log.LogWarning("[Voice] ScalerCore.AudioPitchHelper not found — voice mod toggle disabled");
 
-            // Cart scaling — patch whichever lifecycle method PhysGrabInCart defines.
-            // Kept separate from PhysGrabObjectPatch to avoid any interference with item scaling.
-            bool cartPatched = false;
-            foreach (var lifecycle in new[] { "Start", "Awake", "OnEnable" })
+            // Revive resets localScale — re-shrink after recovery. Tumble/Hurt patches were tried
+            // but ForceShrink mid-tumble destroys ScalerCore's controller and breaks the tumble
+            // state, leaving the player at full size. The continuous LateUpdate watcher handles
+            // damage/tumble scale resets without that destructive side effect.
+            foreach (var name in new[] { "ReviveRPC", "Revive" })
             {
-                var m = AccessTools.Method(typeof(PhysGrabInCart), lifecycle);
-                if (m == null) continue;
-                harmony.Patch(m, postfix: new HarmonyMethod(typeof(CartPatch), nameof(CartPatch.Postfix)));
-                Log.LogInfo($"[Cart] Patched PhysGrabInCart.{lifecycle}");
-                cartPatched = true;
-                break;
-            }
-            if (!cartPatched)
-                Log.LogWarning("PhysGrabInCart lifecycle method not found — cart will not be scaled");
-
-            // Revive/get-up resets localScale — re-shrink after recovery.
-            foreach (var reviveName in new[] { "ReviveRPC", "Revive", "RevivedRPC", "GetUp", "GetUpRPC" })
-            {
-                var m = AccessTools.Method(typeof(PlayerAvatar), reviveName);
+                var m = AccessTools.Method(typeof(PlayerAvatar), name);
                 if (m == null) continue;
                 harmony.Patch(m, postfix: new HarmonyMethod(typeof(PlayerRevivePatch), nameof(PlayerRevivePatch.Postfix)));
-                Log.LogInfo($"[Revive] Patched {reviveName}");
+                Log.LogInfo($"[Revive] Patched {name}");
             }
 
             Log.LogInfo($"MiniEepo v{PluginInfo.PLUGIN_VERSION} loaded — everything is tiny now.");
@@ -111,77 +108,129 @@ namespace MiniEepo
             ActiveVoiceMod      = VoiceMod.Value;
         }
 
+        // True when REPO is in an actual gameplay level — not the main menu, not the truck/lobby.
+        // Uses RunManager's level tracking (REPO loads levels additively, so SceneManager.activeScene
+        // stays "Level - Lobby Menu" the whole time and isn't reliable here).
+        internal static bool IsInGameplay()
+        {
+            // Also require being in a Photon room — at game startup RunManager.levelCurrent has a
+            // non-lobby default value which would otherwise wrongly read as "in gameplay".
+            if (!PhotonNetwork.InRoom) return false;
+            var rm = RunManager.instance;
+            if (rm == null) return false;
+            var current = rm.levelCurrent;
+            if (current == null) return false;
+            return current != rm.levelLobby && current != rm.levelLobbyMenu;
+        }
+
         internal static readonly HashSet<int> ManagedObjects = new HashSet<int>();
+        // Re-entrancy guard: ScalerCore attaches its controller to the same GameObject as the target,
+        // so ScaleManagerApplyPatch would otherwise block our own first-time scales. Set true while
+        // we are inside ApplyIfNotScaled so the patch lets our calls through.
+        internal static bool IsApplying;
 
         internal static void Shrink(GameObject go, float factor)
         {
             ManagedObjects.Add(go.GetInstanceID());
             var opts = ScaleOptions.Default; // ScaleOptions is a struct; this is a safe value copy
             opts.Factor = factor;
-            ScaleManager.ApplyIfNotScaled(go, opts);
+            IsApplying = true;
+            try { ScaleManager.ApplyIfNotScaled(go, opts); }
+            finally { IsApplying = false; }
         }
 
-        // Like Shrink, but clears ScalerCore's internal state first so it re-applies even if
-        // the game reset localScale externally (e.g. after revive/damage recovery).
-        internal static void ForceShrink(GameObject go, float factor)
-        {
-            ManagedObjects.Remove(go.GetInstanceID());
-            var ctrl = ScaleManager.GetController(go);
-            // DestroyImmediate so ApplyIfNotScaled sees a fresh object this same frame.
-            if (ctrl != null && ctrl is UnityEngine.Component comp)
-                UnityEngine.Object.DestroyImmediate(comp);
-            Shrink(go, factor);
-        }
     }
 
-    internal class SettingsSyncer : MonoBehaviourPunCallbacks
+    // Plain MonoBehaviour with polling — abandoned MonoBehaviourPunCallbacks because OnJoinedRoom /
+    // OnRoomPropertiesUpdate weren't firing for us in any tested setup, despite ScalerCore's RPC
+    // dispatch working. Polling sidesteps the entire callback-registration mystery.
+    internal class SettingsSyncer : MonoBehaviour
     {
+        // VoiceMod intentionally not synced — it controls what the local listener hears, so each
+        // client should be able to opt out (or in) regardless of the host's setting.
         private const string K_PLAYER   = "ME_PS";
         private const string K_ITEM     = "ME_IS";
         private const string K_VALUABLE = "ME_VS";
         private const string K_CART     = "ME_CS";
-        private const string K_VOICE    = "ME_VM";
 
-        // MonoBehaviourPunCallbacks.OnEnable() calls PhotonNetwork.AddCallbackTarget
-        // immediately, which faults if Photon isn't initialized yet (e.g. during Plugin.Awake).
-        // Suppress auto-registration and do it ourselves in Start instead.
-        public override void OnEnable() { }
-        public override void OnDisable() { }
+        // Static singleton — FindObjectOfType doesn't reliably find us when attached to the BepInEx
+        // plugin GameObject (which lives outside the normal scene hierarchy).
+        internal static SettingsSyncer? Instance;
 
-        private void Start() => PhotonNetwork.AddCallbackTarget(this);
-        private void OnDestroy() => PhotonNetwork.RemoveCallbackTarget(this);
+        private bool _wasInRoom;
+        private bool _wasMaster;
+        private float _pullPollDelay;
 
-        // Called on all clients when room properties change (including after PushHostSettings)
-        public override void OnRoomPropertiesUpdate(ExitGames.Client.Photon.Hashtable changed)
+        private void Awake() => Instance = this;
+        private void Start() => Plugin.Log.LogInfo("[Sync] SettingsSyncer ready (polling mode)");
+
+        // Called from RunManagerUpdateLevelPatch when REPO transitions to a gameplay level.
+        internal void TriggerRescale() => StartCoroutine(RescaleAfterJoin());
+
+        private void Update()
         {
-            if (changed.ContainsKey(K_PLAYER))   Plugin.ActivePlayerScale   = (float)changed[K_PLAYER];
-            if (changed.ContainsKey(K_ITEM))      Plugin.ActiveItemScale     = (float)changed[K_ITEM];
-            if (changed.ContainsKey(K_VALUABLE))  Plugin.ActiveValuableScale = (float)changed[K_VALUABLE];
-            if (changed.ContainsKey(K_CART))      Plugin.ActiveCartScale     = (float)changed[K_CART];
-            if (changed.ContainsKey(K_VOICE))     Plugin.ActiveVoiceMod      = (bool)changed[K_VOICE];
-            Plugin.Log.LogInfo($"[Sync] Settings received from host — player={Plugin.ActivePlayerScale} item={Plugin.ActiveItemScale} valuable={Plugin.ActiveValuableScale} cart={Plugin.ActiveCartScale} voiceMod={Plugin.ActiveVoiceMod}");
-        }
+            // Detect room-state transitions and pull/push settings accordingly. Cheap — just two
+            // static bool reads against cached state.
+            bool inRoom = PhotonNetwork.InRoom;
+            bool master = inRoom && PhotonNetwork.IsMasterClient;
 
-        // Non-host clients: read existing room properties on join
-        public override void OnJoinedRoom()
-        {
-            if (PhotonNetwork.IsMasterClient)
+            if (inRoom && !_wasInRoom)
             {
+                if (master) PushHostSettings();
+                else        PullHostSettings();
+            }
+            else if (!inRoom && _wasInRoom)
+            {
+                Plugin.ResetToLocalConfig();
+                Plugin.Log.LogInfo("[Sync] Left room — reset to local config");
+            }
+            else if (inRoom && master && !_wasMaster)
+            {
+                // We just became master client (e.g. host migration) — push our settings.
                 PushHostSettings();
             }
-            else
+            else if (inRoom && !master)
             {
-                var props = PhotonNetwork.CurrentRoom?.CustomProperties;
-                if (props != null) OnRoomPropertiesUpdate(props);
-                StartCoroutine(RescaleAfterJoin());
+                // Cheap re-poll once a second in case host pushed after we joined.
+                _pullPollDelay -= Time.unscaledDeltaTime;
+                if (_pullPollDelay <= 0f)
+                {
+                    _pullPollDelay = 1f;
+                    PullHostSettings();
+                }
+            }
+
+            _wasInRoom = inRoom;
+            _wasMaster = master;
+        }
+
+        private void LateUpdate()
+        {
+            float target = Plugin.ActivePlayerScale;
+            if (target >= 0.99f || !Plugin.IsInGameplay()) return;
+            foreach (var pa in Object.FindObjectsOfType<PlayerAvatar>())
+            {
+                var s = pa.transform.localScale.x;
+                if (s > 0.9f && s > target + 0.4f)
+                {
+                    // Direct set only. ScaleManager.Apply with same factor would TOGGLE off
+                    // (ScalerCore treats same-factor-on-scaled-object as ShrinkerGun toggle).
+                    pa.transform.localScale = new Vector3(target, target, target);
+                }
             }
         }
 
-        // New master client takes over and pushes their settings
-        public override void OnMasterClientSwitched(Player newMasterClient)
+private void PullHostSettings()
         {
-            if (newMasterClient.IsLocal)
-                PushHostSettings();
+            var props = PhotonNetwork.CurrentRoom?.CustomProperties;
+            if (props == null) return;
+            bool changed = false;
+            if (props.ContainsKey(K_PLAYER))   { var v = (float)props[K_PLAYER];   if (Plugin.ActivePlayerScale   != v) { Plugin.ActivePlayerScale   = v; changed = true; } }
+            if (props.ContainsKey(K_ITEM))     { var v = (float)props[K_ITEM];     if (Plugin.ActiveItemScale     != v) { Plugin.ActiveItemScale     = v; changed = true; } }
+            if (props.ContainsKey(K_VALUABLE)) { var v = (float)props[K_VALUABLE]; if (Plugin.ActiveValuableScale != v) { Plugin.ActiveValuableScale = v; changed = true; } }
+            if (props.ContainsKey(K_CART))     { var v = (float)props[K_CART];     if (Plugin.ActiveCartScale     != v) { Plugin.ActiveCartScale     = v; changed = true; } }
+            if (changed)
+                Plugin.Log.LogInfo($"[Sync] Pulled host settings — player={Plugin.ActivePlayerScale} item={Plugin.ActiveItemScale} valuable={Plugin.ActiveValuableScale} cart={Plugin.ActiveCartScale}");
         }
 
         private void PushHostSettings()
@@ -193,63 +242,99 @@ namespace MiniEepo
                 [K_ITEM]     = Plugin.ItemScale.Value,
                 [K_VALUABLE] = Plugin.ValuableScale.Value,
                 [K_CART]     = Plugin.CartScale.Value,
-                [K_VOICE]    = Plugin.VoiceMod.Value,
             };
             PhotonNetwork.CurrentRoom.SetCustomProperties(props);
-            Plugin.Log.LogInfo($"[Sync] Host settings pushed — player={Plugin.PlayerScale.Value} item={Plugin.ItemScale.Value} valuable={Plugin.ValuableScale.Value} cart={Plugin.CartScale.Value}");
+            Plugin.ResetToLocalConfig();
+            Plugin.Log.LogInfo($"[Sync] Host pushed settings — player={Plugin.PlayerScale.Value} item={Plugin.ItemScale.Value} valuable={Plugin.ValuableScale.Value} cart={Plugin.CartScale.Value}");
         }
 
-        // Singleplayer / lobby: reset to local config
-        public override void OnLeftRoom() => Plugin.ResetToLocalConfig();
-
-        // After joining as non-host, items may have already spawned before sync arrived.
-        // Re-scale everything once Photon settles.
         private IEnumerator RescaleAfterJoin()
         {
-            yield return new WaitForSeconds(1f);
+            yield return new WaitForSeconds(3f);
+            Plugin.Log.LogInfo("[Sync] Running post-join rescale pass");
             foreach (var pgo in FindObjectsOfType<PhysGrabObject>())
             {
                 var attrs = pgo.GetComponentInParent<ItemAttributes>(includeInactive: true)
                          ?? pgo.GetComponentInChildren<ItemAttributes>(includeInactive: true);
                 if (attrs != null)
-                    Plugin.ForceShrink(attrs.gameObject, Plugin.ActiveItemScale);
+                    Plugin.Shrink(attrs.gameObject, Plugin.ActiveItemScale);
             }
-            foreach (var vo in FindObjectsOfType<ValuableObject>())
-                Plugin.ForceShrink(vo.gameObject, Plugin.ActiveValuableScale);
             foreach (var pa in FindObjectsOfType<PlayerAvatar>())
-                Plugin.ForceShrink(pa.gameObject, Plugin.ActivePlayerScale);
+                Plugin.Shrink(pa.gameObject, Plugin.ActivePlayerScale);
         }
     }
 
     [HarmonyPatch(typeof(PlayerAvatar), "Start")]
     internal static class PlayerAvatarPatch
     {
+        // Track non-host direct-scale players by instance id so we don't double-apply.
+        internal static readonly HashSet<int> DirectScaledPlayers = new HashSet<int>();
+
         private static IEnumerator ShrinkNextFrame(PlayerAvatar instance)
         {
             yield return null;
-            Plugin.Shrink(instance.gameObject, Plugin.ActivePlayerScale);
+            if (!Plugin.IsInGameplay()) yield break;
+
+            var pv = instance.GetComponent<Photon.Pun.PhotonView>();
+            bool useShrink = pv == null || pv.IsMine || PhotonNetwork.IsMasterClient;
+            if (useShrink)
+            {
+                // Owner or master client — use ScalerCore for full effect (animation, mass, RPC).
+                Plugin.Shrink(instance.gameObject, Plugin.ActivePlayerScale);
+            }
+            else
+            {
+                // Non-owner on non-master: ScalerCore refuses to apply non-owned objects, and the
+                // host's RPC may have raced past our handler-registration. Bypass ScalerCore and
+                // direct-multiply the transform — same pattern as items/valuables (which work).
+                if (DirectScaledPlayers.Add(instance.gameObject.GetInstanceID()))
+                    instance.transform.localScale *= Plugin.ActivePlayerScale;
+            }
         }
 
         private static void Postfix(PlayerAvatar __instance) =>
             __instance.StartCoroutine(ShrinkNextFrame(__instance));
     }
 
+    // Fires whenever REPO transitions to a new level — including the lobby→gameplay jump where
+    // SceneManager.sceneLoaded doesn't fire (REPO loads levels additively). This is our reliable
+    // hook for "we just entered gameplay; shrink everything."
+    [HarmonyPatch(typeof(RunManager), "UpdateLevel")]
+    internal static class RunManagerUpdateLevelPatch
+    {
+        static void Postfix(RunManager __instance)
+        {
+            if (!Plugin.IsInGameplay()) return;
+            SettingsSyncer.Instance?.TriggerRescale();
+        }
+    }
+
     [HarmonyPatch(typeof(PhysGrabObject), "Start")]
     internal static class PhysGrabObjectPatch
     {
+        // Track non-host direct-scale items by instance id, so RescaleAfterJoin doesn't double-apply.
+        internal static readonly HashSet<int> DirectScaledItems = new HashSet<int>();
+
         private static void Postfix(PhysGrabObject __instance)
         {
+            GameObject? target = null;
             // ItemAttributes above the PhysGrabObject — original hierarchy; scale from that root.
             var attrsAbove = __instance.GetComponentInParent<ItemAttributes>(includeInactive: true);
-            if (attrsAbove != null)
+            if (attrsAbove != null) target = attrsAbove.gameObject;
+            else if (__instance.GetComponentInChildren<ItemAttributes>(includeInactive: true) != null)
+                target = __instance.gameObject;
+            if (target == null) return;
+
+            // ScalerCore's ItemHandler doesn't sync via RPC (only PlayerHandler/CartHandler do) and
+            // refuses to scale objects the local client doesn't own. On non-host, fall back to direct
+            // localScale multiplication so items still appear small.
+            if (PhotonNetwork.InRoom && !PhotonNetwork.IsMasterClient)
             {
-                Plugin.Shrink(attrsAbove.gameObject, Plugin.ActiveItemScale);
+                if (DirectScaledItems.Add(target.GetInstanceID()))
+                    target.transform.localScale *= Plugin.ActiveItemScale;
                 return;
             }
-            // ItemAttributes below (child) — game update may have moved it; scale from here.
-            var attrsBelow = __instance.GetComponentInChildren<ItemAttributes>(includeInactive: true);
-            if (attrsBelow != null)
-                Plugin.Shrink(__instance.gameObject, Plugin.ActiveItemScale);
+            Plugin.Shrink(target, Plugin.ActiveItemScale);
         }
     }
 
@@ -276,45 +361,36 @@ namespace MiniEepo
         }
     }
 
-    // Applied manually in Plugin.Awake.
-    // Returning false skips ScalerCore's OverridePitch entirely, keeping pitch at 1.0.
+
+    // Applied manually in Plugin.Awake. Returning false skips ScalerCore's ApplyPitch entirely
+    // when VoiceMod is off — pitch is never modified, so audio plays at normal pitch.
     internal static class VoicePitchPatch
     {
-        internal static bool Prefix() => Plugin.ActiveVoiceMod;
+        public static bool Prefix() => Plugin.ActiveVoiceMod;
     }
 
-    // Applied manually in Plugin.Awake for each candidate revive method name.
-    // Revive/get-up animations in REPO reset transform.localScale; ForceShrink clears
-    // ScalerCore's internal state so the scale is re-applied correctly.
+    // Applied manually in Plugin.Awake for revive method names — re-shrinks after the
+    // animation that resets localScale. Direct-sets transform.localScale (no ForceShrink, which
+    // would DestroyImmediate ScalerCore's controller and break its tracking mid-animation).
     internal static class PlayerRevivePatch
     {
         internal static void Postfix(PlayerAvatar __instance)
         {
-            Plugin.ForceShrink(__instance.gameObject, Plugin.ActivePlayerScale);
-        }
-    }
-
-    // Applied manually in Plugin.Awake — scales the cart to match item/player scale.
-    // PhysGrabInCart is the trigger-zone component on the cart; its lifecycle method
-    // fires after the cart is fully initialised in the scene.
-    internal static class CartPatch
-    {
-        internal static void Postfix(PhysGrabInCart __instance)
-        {
-            // Walk up to the PhysGrabObject (the physics root of the cart), fall back to transform.root.
-            var pgo = __instance.GetComponentInParent<PhysGrabObject>(includeInactive: true);
-            var root = pgo != null ? pgo.gameObject : __instance.transform.root.gameObject;
-            Plugin.Shrink(root, Plugin.ActiveItemScale);
+            float t = Plugin.ActivePlayerScale;
+            if (t < 0.99f) __instance.transform.localScale = new Vector3(t, t, t);
         }
     }
 
     // Block external mods (e.g. ShrinkerGun) from toggling/restoring MiniEepo-managed objects.
-    // ScalerCore's "same factor → toggle" would otherwise unshrink players and items when shot.
+    // Always allow our own calls (gated by Plugin.IsApplying) so ScalerCore can register and apply
+    // the initial scale — ScalerCore attaches its controller to the same GameObject as the target,
+    // which would otherwise make this patch self-block.
     [HarmonyPatch(typeof(ScaleManager), "Apply", typeof(GameObject), typeof(ScaleOptions))]
     internal static class ScaleManagerApplyPatch
     {
         static bool Prefix(GameObject target)
         {
+            if (Plugin.IsApplying) return true;
             var ctrl = ScaleManager.GetController(target);
             int id = ctrl != null ? ctrl.gameObject.GetInstanceID() : target.GetInstanceID();
             return !Plugin.ManagedObjects.Contains(id);
