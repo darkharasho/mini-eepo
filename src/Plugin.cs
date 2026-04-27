@@ -54,7 +54,12 @@ namespace MiniEepo
                 new ConfigDescription("Grab strength/range/throw multiplier when shrunk. 1.0 = full original strength (no nerf). Lower values reduce grip.",
                     new AcceptableValueRange<float>(0.0f, 1.0f)));
 
+
             ResetToLocalConfig();
+
+            // Keep ActiveVoiceMod in sync when the user changes the toggle at runtime via
+            // REPOConfig. Without this, the patches keep using the startup value forever.
+            VoiceMod.SettingChanged += (_, _) => ActiveVoiceMod = VoiceMod.Value;
 
             // Attach SettingsSyncer to our own plugin GameObject (BepInEx keeps it alive across
             // scenes). A fresh GameObject didn't reliably get its Start callback fired.
@@ -120,13 +125,34 @@ namespace MiniEepo
             var getGrabFactors = playerHandler != null
                 ? AccessTools.Method(playerHandler, "GetGrabFactors")
                 : null;
-            if (getGrabFactors != null)
+            // GrabFactorsPatch DISABLED for testing — let ScalerCore use its default (0.6 strength,
+            // factor range) to compare against ShrinkerGun behavior. If items hold fine without
+            // our override, the patch was causing droop.
+            // if (getGrabFactors != null) harmony.Patch(getGrabFactors, postfix: ...);
+            _ = getGrabFactors;
+
+            // Stop ScalerCore from un-shrinking players when they take damage (PlayerBonkPatch
+            // postfix calls controller.RequestBonkExpand on hp drop). Patching the patch's Postfix
+            // to return false-equivalent skips the bonk-expand entirely, without touching
+            // ScaleOptions (which affected grab feel).
+            System.Type? bonkPatch = null;
+            foreach (var asm in System.AppDomain.CurrentDomain.GetAssemblies())
             {
-                harmony.Patch(getGrabFactors, postfix: new HarmonyMethod(typeof(GrabFactorsPatch), nameof(GrabFactorsPatch.Postfix)));
-                Log.LogInfo($"[Strength] Patched {playerHandler!.FullName}.GetGrabFactors");
+                if (asm.GetName().Name != "ScalerCore") continue;
+                foreach (var t in asm.GetTypes())
+                    if (t.Name == "PlayerBonkPatch") { bonkPatch = t; break; }
+                if (bonkPatch != null) break;
+            }
+            var bonkPostfix = bonkPatch != null ? AccessTools.Method(bonkPatch, "Postfix") : null;
+            if (bonkPostfix != null)
+            {
+                harmony.Patch(bonkPostfix, prefix: new HarmonyMethod(typeof(BonkBlocker), nameof(BonkBlocker.Prefix)));
+                Log.LogInfo($"[BonkImmune] Disabled ScalerCore's damage-bonk-expand (damage no longer un-shrinks)");
             }
             else
-                Log.LogWarning("[Strength] PlayerHandler.GetGrabFactors not found");
+                Log.LogWarning("[BonkImmune] PlayerBonkPatch.Postfix not found — damage may un-shrink");
+
+
 
             // Revive resets localScale — re-shrink after recovery. Tumble/Hurt patches were tried
             // but ForceShrink mid-tumble destroys ScalerCore's controller and breaks the tumble
@@ -176,18 +202,12 @@ namespace MiniEepo
         internal static void Shrink(GameObject go, float factor)
         {
             ManagedObjects.Add(go.GetInstanceID());
-            var opts = ScaleOptions.Default; // ScaleOptions is a struct; this is a safe value copy
+            var opts = ScaleOptions.Default;
             opts.Factor = factor;
-            // Damage-bonk would auto-expand shrunk objects via PlayerBonkPatch — infinite immunity disables it.
-            opts.BonkImmuneDuration = float.PositiveInfinity;
-            // Preserve original mass — without this, items get clamp(originalMass * factor, 0.5, ...)
-            // which makes guns and other items feel droopy/floaty due to reduced inertia.
-            opts.PreserveMass = true;
             IsApplying = true;
             try { ScaleManager.ApplyIfNotScaled(go, opts); }
             finally { IsApplying = false; }
         }
-
     }
 
     // Plain MonoBehaviour with polling — abandoned MonoBehaviourPunCallbacks because OnJoinedRoom /
@@ -255,25 +275,49 @@ namespace MiniEepo
 
         private void LateUpdate()
         {
-            float target = Plugin.ActivePlayerScale;
-            if (target >= 0.99f || !Plugin.IsInGameplay()) return;
-            foreach (var pa in Object.FindObjectsOfType<PlayerAvatar>())
+            if (!Plugin.IsInGameplay()) return;
+
+            // Player + their visible body sibling.
+            float pTarget = Plugin.ActivePlayerScale;
+            if (pTarget < 0.99f)
             {
-                if (pa == null) continue; // destroyed Unity object
-                Transform paT;
-                try { paT = pa.transform; } catch { continue; }
-                if (paT == null) continue;
-                var s = paT.localScale.x;
-                if (s > 0.9f && s > target + 0.4f)
-                    paT.localScale = new Vector3(target, target, target);
-                var parent = paT.parent;
-                if (parent == null) continue;
-                Transform? visuals;
-                try { visuals = parent.Find("Player Visuals"); } catch { continue; }
-                if (visuals == null) continue;
-                var vs = visuals.localScale.x;
-                if (vs > 0.9f && vs > target + 0.4f)
-                    visuals.localScale = new Vector3(target, target, target);
+                foreach (var pa in Object.FindObjectsOfType<PlayerAvatar>())
+                {
+                    if (pa == null) continue;
+                    Transform paT;
+                    try { paT = pa.transform; } catch { continue; }
+                    if (paT == null) continue;
+                    var s = paT.localScale.x;
+                    if (s > 0.9f && s > pTarget + 0.4f)
+                        paT.localScale = new Vector3(pTarget, pTarget, pTarget);
+                    var parent = paT.parent;
+                    if (parent == null) continue;
+                    Transform? visuals;
+                    try { visuals = parent.Find("Player Visuals"); } catch { continue; }
+                    if (visuals == null) continue;
+                    var vs = visuals.localScale.x;
+                    if (vs > 0.9f && vs > pTarget + 0.4f)
+                        visuals.localScale = new Vector3(pTarget, pTarget, pTarget);
+                }
+            }
+
+            // Items — un-pocketing from inventory resets scale back to 1.0 but ScalerCore's
+            // controller still thinks IsScaled=true. Direct-set the scale instead of going
+            // through Restore+Shrink (which animates 0.4→1.0→0.4 and produces a visible flash
+            // when guns are pulled from inventory). ScalerCore's per-frame OnLateUpdate also
+            // forces _t.localScale = _target while IsScaled, so this is consistent with that.
+            float iTarget = Plugin.ActiveItemScale;
+            if (iTarget < 0.99f)
+            {
+                foreach (var equip in Object.FindObjectsOfType<ItemEquippable>())
+                {
+                    if (equip == null) continue;
+                    var attrs = equip.GetComponentInParent<ItemAttributes>(includeInactive: true);
+                    GameObject target = attrs != null ? attrs.gameObject : equip.gameObject;
+                    var s = target.transform.localScale.x;
+                    if (s > 0.9f && s > iTarget + 0.4f)
+                        target.transform.localScale = new Vector3(iTarget, iTarget, iTarget);
+                }
             }
         }
 
@@ -332,29 +376,58 @@ private void PullHostSettings()
             yield return null;
             if (!Plugin.IsInGameplay()) yield break;
 
-            var pv = instance.GetComponent<Photon.Pun.PhotonView>();
-            bool useShrink = pv == null || pv.IsMine || PhotonNetwork.IsMasterClient;
-            if (useShrink)
+            // Only the host calls Plugin.Shrink for player avatars — matches ShrinkerGun's pattern
+            // (only the host calls ScaleManager.Apply). Non-hosts get scaled via the host's RPC_Shrink.
+            //
+            // If non-hosts ALSO call Plugin.Shrink locally for their own avatar, ScalerCore's
+            // ApplyLocalPlayerShrinkEffects runs twice on them: once from local DispatchShrink, then
+            // again when host's RPC_Shrink arrives. The second pass re-caches the already-scaled
+            // VisionTarget / camera offsets as "original" and scales them again, collapsing held
+            // item position to ~16% of true eye height — the droop bug.
+            if (PhotonNetwork.IsMasterClient || !PhotonNetwork.InRoom)
             {
-                Plugin.Shrink(instance.gameObject, Plugin.ActivePlayerScale);
-            }
-            else
-            {
-                if (DirectScaledPlayers.Add(instance.gameObject.GetInstanceID()))
+                // For the LOCAL player avatar (host's own, or singleplayer), wait until the
+                // singletons ApplyLocalPlayerShrinkEffects depends on are bound. Otherwise the
+                // VisionTarget / camera / grab-distance scaling silently no-ops, leaving held
+                // items dangling at full-size eye height.
+                var pv = instance.GetComponent<Photon.Pun.PhotonView>();
+                bool isLocal = pv == null || pv.IsMine;
+                if (isLocal)
                 {
-                    var current = instance.transform.localScale.x;
-                    if (current > 0.99f)
-                        instance.transform.localScale *= Plugin.ActivePlayerScale;
-                    // Also scale "Player Visuals" — it's a SIBLING of "Player Avatar Controller"
-                    // under "PlayerAvatar(Clone)", and it holds the actual visible character mesh.
-                    // Our root-only scale doesn't propagate to siblings.
-                    var parent = instance.transform.parent;
-                    if (parent != null)
+                    float w = 0f;
+                    while (w < 5f &&
+                           (PhysGrabber.instance == null ||
+                            instance.GetComponent<PlayerVisionTarget>() == null ||
+                            CameraPosition.instance == null))
                     {
-                        var visuals = parent.Find("Player Visuals");
-                        if (visuals != null && visuals.localScale.x > 0.99f)
-                            visuals.localScale *= Plugin.ActivePlayerScale;
+                        w += Time.deltaTime;
+                        yield return null;
                     }
+                    if (!Plugin.IsInGameplay()) yield break;
+                }
+                Plugin.Shrink(instance.gameObject, Plugin.ActivePlayerScale);
+                yield break;
+            }
+
+            // Non-host: wait briefly for host's RPC_Shrink to land. If it doesn't (e.g. host is
+            // running without MiniEepo), fall back to direct localScale so the player still appears
+            // small visually. No ScalerCore controller in this branch — purely cosmetic.
+            float waited = 0f;
+            while (waited < 5f && instance.transform.localScale.x > 0.99f)
+            {
+                waited += Time.deltaTime;
+                yield return null;
+            }
+            if (instance.transform.localScale.x > 0.99f &&
+                DirectScaledPlayers.Add(instance.gameObject.GetInstanceID()))
+            {
+                instance.transform.localScale *= Plugin.ActivePlayerScale;
+                var parent = instance.transform.parent;
+                if (parent != null)
+                {
+                    var visuals = parent.Find("Player Visuals");
+                    if (visuals != null && visuals.localScale.x > 0.99f)
+                        visuals.localScale *= Plugin.ActivePlayerScale;
                 }
             }
         }
@@ -416,10 +489,8 @@ private void PullHostSettings()
             if (!_scaled.Add(id)) return;
             __instance.transform.localScale *= Plugin.ActiveValuableScale;
 
-            if (Plugin.ActiveCartScale >= 1.0f) return;
-
-            // Attach tracker to the PhysGrabObject's GameObject (where the Rigidbody lives)
-            // so OnTriggerEnter/Exit fires when the valuable enters the cart's trigger zone.
+            // Always attach the tracker — the gate on ActiveCartScale is in OnTriggerEnter so it
+            // works even when valuables spawn before the host's settings sync arrives.
             var pgo = __instance.GetComponentInChildren<PhysGrabObject>(includeInactive: true)
                    ?? __instance.GetComponentInParent<PhysGrabObject>(includeInactive: true);
             var target = pgo != null ? pgo.gameObject : __instance.gameObject;
@@ -434,12 +505,24 @@ private void PullHostSettings()
     // Postfix on ScalerCore.PlayerHandler.GetGrabFactors. The original returns (strengthMul, rangeMul)
     // based on shrink factor — at factor=0.4 it returns ~(0.6, 0.4), nerfing the player's grip.
     // We override the result with our user-configurable multiplier (default 1.0 = full strength).
+    // Skip ScalerCore.Patches.PlayerBonkPatch.Postfix — that's the patch that calls
+    // RequestBonkExpand on the player's controller when their HP drops. Skipping it keeps
+    // damage from un-shrinking players, without altering ScaleOptions (BonkImmuneDuration).
+    internal static class BonkBlocker
+    {
+        public static bool Prefix() => false;
+    }
+
     internal static class GrabFactorsPatch
     {
+        // Item1 = strength multiplier, Item2 = range multiplier.
+        // Only override the strength multiplier — keep ScalerCore's range multiplier (= scale factor)
+        // intact. Otherwise the player holds items at full grab range (14m+ with strength upgrades),
+        // which exaggerates physics sag on heavy items and makes them droop.
         public static void Postfix(ref System.ValueTuple<float, float> __result)
         {
-            float m = Plugin.GrabStrength.Value;
-            __result = new System.ValueTuple<float, float>(m, m);
+            float strengthMul = Plugin.GrabStrength.Value;
+            __result = new System.ValueTuple<float, float>(strengthMul, __result.Item2);
         }
     }
 
@@ -502,6 +585,68 @@ private void PullHostSettings()
         }
     }
 
+    // SolidAim-style stabilization for held guns when the local player is shrunk. Without this,
+    // shotguns/heavy guns droop because the grab spring isn't strong enough vs gravity torque
+    // for a 40%-scale player whose grab strength is reduced. Applies override-mass + override-
+    // grab-strength + rotation slerp toward camera every FixedUpdate (overrides are timed at
+    // 0.1s so they need re-application). Mirrors jangnana/SolidAim's ApplyAimStabilization.
+    [HarmonyPatch(typeof(PhysGrabObject), "FixedUpdate")]
+    internal static class HeldGunStabilizationPatch
+    {
+        static void Postfix(PhysGrabObject __instance)
+        {
+            var local = SemiFunc.PlayerAvatarLocal();
+            if (local == null) return;
+            float scale = local.transform.localScale.x;
+            if (scale > 0.99f) return; // not shrunk — let vanilla physics run
+            if (!__instance.playerGrabbing.Contains(local.physGrabber)) return;
+
+            var gun = __instance.GetComponent<ItemGun>();
+            if (gun == null) return; // only stabilize guns; other items keep vanilla feel
+
+            __instance.OverrideMass(0.25f, 0.1f);
+            __instance.OverrideGrabStrength(2f, 0.1f);
+            __instance.OverrideTorqueStrength(5f, 0.1f);
+            __instance.OverrideDrag(2f, 0.1f);
+            if (__instance.rb != null) __instance.rb.angularDrag = 29f;
+
+            var cam = Camera.main;
+            if (cam != null && __instance.rb != null)
+                __instance.rb.rotation = Quaternion.Slerp(
+                    __instance.rb.rotation, cam.transform.rotation, Time.fixedDeltaTime * 10f);
+        }
+    }
+
+    // PhysGrabber.StartGrabbingPhysObject hardcodes a `- camera.up * 0.3` offset on the puller
+    // position when grabbing forceGrabPoint items (guns, melee). That 0.3 is in world units and
+    // doesn't scale — for a shrunk player (~0.6 eye height) it puts the puller near the floor,
+    // so guns drop out of view. Add back most of that offset proportionally to player scale so
+    // the puller stays in front of the shrunken eye line.
+    [HarmonyPatch(typeof(PhysGrabber), "StartGrabbingPhysObject")]
+    internal static class GrabPullerOffsetFix
+    {
+        private static System.Reflection.FieldInfo? _camField;
+
+        static void Postfix(PhysGrabber __instance)
+        {
+            var pa = __instance.playerAvatar;
+            if (pa == null) return;
+            float scale = pa.transform.localScale.x;
+            if (scale > 0.99f) return; // not shrunk
+            var puller = __instance.physGrabPointPuller;
+            if (puller == null) return;
+            _camField ??= AccessTools.Field(typeof(PhysGrabber), "playerCamera");
+            var cam = _camField?.GetValue(__instance) as Camera;
+            if (cam == null) return;
+            // Cancel the baked-in -0.3 world-unit down-offset entirely. For shrunk players the
+            // camera is still at near-full-size eye height (capsule unchanged), so any constant
+            // down-offset puts the gun out of FOV. Lift by the full 0.3.
+            Vector3 lift = cam.transform.up * 0.3f;
+            puller.position += lift;
+            __instance.physGrabPointPlane.position += lift;
+        }
+    }
+
     // Block external mods (e.g. ShrinkerGun) from toggling/restoring MiniEepo-managed objects.
     // Always allow our own calls (gated by Plugin.IsApplying) so ScalerCore can register and apply
     // the initial scale — ScalerCore attaches its controller to the same GameObject as the target,
@@ -534,6 +679,7 @@ private void PullHostSettings()
         {
             if (_inCart || _vo == null) return;
             if (other.GetComponentInParent<PhysGrabInCart>() == null) return;
+            if (Plugin.ActiveCartScale >= 1.0f) return; // no-op when host's CartScale is 1.0
             _inCart = true;
             StopAllCoroutines();
             StartCoroutine(ScaleTo(_vo.transform.localScale * Plugin.ActiveCartScale, 0.4f));
