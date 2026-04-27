@@ -3,13 +3,10 @@ using System.Collections.Generic;
 using BepInEx;
 using BepInEx.Configuration;
 using BepInEx.Logging;
-using ExitGames.Client.Photon;
 using HarmonyLib;
 using Photon.Pun;
-using Photon.Realtime;
 using ScalerCore;
 using UnityEngine;
-using UnityEngine.SceneManagement;
 
 namespace MiniEepo
 {
@@ -23,7 +20,6 @@ namespace MiniEepo
         internal static ConfigEntry<float> ValuableScale = null!;
         internal static ConfigEntry<float> CartScale = null!;
         internal static ConfigEntry<bool> VoiceMod = null!;
-        internal static ConfigEntry<float> GrabStrength = null!;
 
         // Active values — start from local config, overridden by host sync
         internal static float ActivePlayerScale;
@@ -49,11 +45,6 @@ namespace MiniEepo
 
             VoiceMod = Config.Bind("Audio", "VoiceMod", true,
                 new ConfigDescription("Enable voice pitch modulation when players are shrunk"));
-
-            GrabStrength = Config.Bind("Scaling", "GrabStrength", 1.0f,
-                new ConfigDescription("Grab strength/range/throw multiplier when shrunk. 1.0 = full original strength (no nerf). Lower values reduce grip.",
-                    new AcceptableValueRange<float>(0.0f, 1.0f)));
-
 
             ResetToLocalConfig();
 
@@ -119,18 +110,6 @@ namespace MiniEepo
             else
                 Log.LogWarning("[Voice] PlayerHandler.OnUpdate not found");
 
-            // Patch GetGrabFactors → return (1, 1) when PreserveGrabStrength is enabled, so shrunk
-            // players keep full grab strength/range/throw. Without this ScalerCore reduces them
-            // proportionally to scale (e.g. factor 0.4 → 0.6 strength multiplier, 0.4 range).
-            var getGrabFactors = playerHandler != null
-                ? AccessTools.Method(playerHandler, "GetGrabFactors")
-                : null;
-            // GrabFactorsPatch DISABLED for testing — let ScalerCore use its default (0.6 strength,
-            // factor range) to compare against ShrinkerGun behavior. If items hold fine without
-            // our override, the patch was causing droop.
-            // if (getGrabFactors != null) harmony.Patch(getGrabFactors, postfix: ...);
-            _ = getGrabFactors;
-
             // Stop ScalerCore from un-shrinking players when they take damage (PlayerBonkPatch
             // postfix calls controller.RequestBonkExpand on hp drop). Patching the patch's Postfix
             // to return false-equivalent skips the bonk-expand entirely, without touching
@@ -151,8 +130,6 @@ namespace MiniEepo
             }
             else
                 Log.LogWarning("[BonkImmune] PlayerBonkPatch.Postfix not found — damage may un-shrink");
-
-
 
             // Revive resets localScale — re-shrink after recovery. Tumble/Hurt patches were tried
             // but ForceShrink mid-tumble destroys ScalerCore's controller and breaks the tumble
@@ -284,19 +261,11 @@ namespace MiniEepo
                 foreach (var pa in Object.FindObjectsOfType<PlayerAvatar>())
                 {
                     if (pa == null) continue;
-                    Transform paT;
-                    try { paT = pa.transform; } catch { continue; }
-                    if (paT == null) continue;
-                    var s = paT.localScale.x;
-                    if (s > 0.9f && s > pTarget + 0.4f)
+                    var paT = pa.transform;
+                    if (paT.localScale.x > 0.9f && paT.localScale.x > pTarget + 0.4f)
                         paT.localScale = new Vector3(pTarget, pTarget, pTarget);
-                    var parent = paT.parent;
-                    if (parent == null) continue;
-                    Transform? visuals;
-                    try { visuals = parent.Find("Player Visuals"); } catch { continue; }
-                    if (visuals == null) continue;
-                    var vs = visuals.localScale.x;
-                    if (vs > 0.9f && vs > pTarget + 0.4f)
+                    var visuals = paT.parent != null ? paT.parent.Find("Player Visuals") : null;
+                    if (visuals != null && visuals.localScale.x > 0.9f && visuals.localScale.x > pTarget + 0.4f)
                         visuals.localScale = new Vector3(pTarget, pTarget, pTarget);
                 }
             }
@@ -321,7 +290,7 @@ namespace MiniEepo
             }
         }
 
-private void PullHostSettings()
+        private void PullHostSettings()
         {
             var props = PhotonNetwork.CurrentRoom?.CustomProperties;
             if (props == null) return;
@@ -390,7 +359,7 @@ private void PullHostSettings()
                 // singletons ApplyLocalPlayerShrinkEffects depends on are bound. Otherwise the
                 // VisionTarget / camera / grab-distance scaling silently no-ops, leaving held
                 // items dangling at full-size eye height.
-                var pv = instance.GetComponent<Photon.Pun.PhotonView>();
+                var pv = instance.GetComponent<PhotonView>();
                 bool isLocal = pv == null || pv.IsMine;
                 if (isLocal)
                 {
@@ -500,30 +469,11 @@ private void PullHostSettings()
     }
 
 
-    // Applied manually in Plugin.Awake. Returning false skips ScalerCore's ApplyPitch entirely
-    // when VoiceMod is off — pitch is never modified, so audio plays at normal pitch.
-    // Postfix on ScalerCore.PlayerHandler.GetGrabFactors. The original returns (strengthMul, rangeMul)
-    // based on shrink factor — at factor=0.4 it returns ~(0.6, 0.4), nerfing the player's grip.
-    // We override the result with our user-configurable multiplier (default 1.0 = full strength).
-    // Skip ScalerCore.Patches.PlayerBonkPatch.Postfix — that's the patch that calls
-    // RequestBonkExpand on the player's controller when their HP drops. Skipping it keeps
-    // damage from un-shrinking players, without altering ScaleOptions (BonkImmuneDuration).
+    // Applied as Prefix on ScalerCore.Patches.PlayerBonkPatch.Postfix — returning false skips
+    // RequestBonkExpand entirely, so taking damage no longer un-shrinks the player.
     internal static class BonkBlocker
     {
         public static bool Prefix() => false;
-    }
-
-    internal static class GrabFactorsPatch
-    {
-        // Item1 = strength multiplier, Item2 = range multiplier.
-        // Only override the strength multiplier — keep ScalerCore's range multiplier (= scale factor)
-        // intact. Otherwise the player holds items at full grab range (14m+ with strength upgrades),
-        // which exaggerates physics sag on heavy items and makes them droop.
-        public static void Postfix(ref System.ValueTuple<float, float> __result)
-        {
-            float strengthMul = Plugin.GrabStrength.Value;
-            __result = new System.ValueTuple<float, float>(strengthMul, __result.Item2);
-        }
     }
 
     internal static class VoicePitchPatch
