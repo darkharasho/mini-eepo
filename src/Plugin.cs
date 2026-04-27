@@ -23,6 +23,7 @@ namespace MiniEepo
         internal static ConfigEntry<float> ValuableScale = null!;
         internal static ConfigEntry<float> CartScale = null!;
         internal static ConfigEntry<bool> VoiceMod = null!;
+        internal static ConfigEntry<float> GrabStrength = null!;
 
         // Active values — start from local config, overridden by host sync
         internal static float ActivePlayerScale;
@@ -49,6 +50,10 @@ namespace MiniEepo
             VoiceMod = Config.Bind("Audio", "VoiceMod", true,
                 new ConfigDescription("Enable voice pitch modulation when players are shrunk"));
 
+            GrabStrength = Config.Bind("Scaling", "GrabStrength", 1.0f,
+                new ConfigDescription("Grab strength/range/throw multiplier when shrunk. 1.0 = full original strength (no nerf). Lower values reduce grip.",
+                    new AcceptableValueRange<float>(0.0f, 1.0f)));
+
             ResetToLocalConfig();
 
             // Attach SettingsSyncer to our own plugin GameObject (BepInEx keeps it alive across
@@ -58,10 +63,10 @@ namespace MiniEepo
             var harmony = new Harmony("darkharasho.MiniEepo");
             harmony.PatchAll();
 
-            // Voice mod: patch ScalerCore's AudioPitchHelper.ApplyPitch — return false from prefix
-            // when VoiceMod is off, suppressing the pitch change at its source. More reliable than
-            // racing to reset AudioSource.pitch after the fact (which only catches looping sounds,
-            // not one-shots).
+            // Voice mod has two separate pitch mechanisms in ScalerCore + REPO:
+            //   (1) AudioPitchHelper.ApplyPitch — pitches Sound objects (grunts, voice lines)
+            //   (2) PlayerVoiceChat.OverridePitch — Photon Voice / actual microphone pitch
+            // Both must be suppressed when VoiceMod is off. The same prefix works for both.
             System.Type? pitchHelper = null;
             foreach (var asm in System.AppDomain.CurrentDomain.GetAssemblies())
             {
@@ -70,19 +75,58 @@ namespace MiniEepo
                     if (t.Name == "AudioPitchHelper") { pitchHelper = t; break; }
                 if (pitchHelper != null) break;
             }
-            if (pitchHelper != null)
+            var applyPitch = pitchHelper != null ? AccessTools.Method(pitchHelper, "ApplyPitch") : null;
+            if (applyPitch != null)
             {
-                var applyPitch = AccessTools.Method(pitchHelper, "ApplyPitch");
-                if (applyPitch != null)
-                {
-                    harmony.Patch(applyPitch, prefix: new HarmonyMethod(typeof(VoicePitchPatch), nameof(VoicePitchPatch.Prefix)));
-                    Log.LogInfo($"[Voice] Patched {pitchHelper.FullName}.ApplyPitch");
-                }
-                else
-                    Log.LogWarning($"[Voice] {pitchHelper.FullName}.ApplyPitch not found");
+                harmony.Patch(applyPitch, prefix: new HarmonyMethod(typeof(VoicePitchPatch), nameof(VoicePitchPatch.Prefix)));
+                Log.LogInfo($"[Voice] Patched {pitchHelper!.FullName}.ApplyPitch (Sound pitch)");
             }
             else
-                Log.LogWarning("[Voice] ScalerCore.AudioPitchHelper not found — voice mod toggle disabled");
+                Log.LogWarning("[Voice] AudioPitchHelper.ApplyPitch not found");
+
+            var voiceChatType = AccessTools.TypeByName("PlayerVoiceChat");
+            var overridePitch = voiceChatType != null ? AccessTools.Method(voiceChatType, "OverridePitch") : null;
+            if (overridePitch != null)
+            {
+                harmony.Patch(overridePitch, prefix: new HarmonyMethod(typeof(VoicePitchPatch), nameof(VoicePitchPatch.Prefix)));
+                Log.LogInfo("[Voice] Patched PlayerVoiceChat.OverridePitch (Photon Voice pitch)");
+            }
+            else
+                Log.LogWarning("[Voice] PlayerVoiceChat.OverridePitch not found");
+
+            // ScalerCore's PlayerHandler.OnUpdate writes voiceChat.overridePitchMultiplierTarget /
+            // overridePitchTimer / overridePitchIsActive AS DIRECT FIELD ASSIGNMENTS every frame —
+            // bypasses OverridePitch entirely. Postfix-reset those fields when VoiceMod is off.
+            System.Type? playerHandler = null;
+            foreach (var asm in System.AppDomain.CurrentDomain.GetAssemblies())
+            {
+                if (asm.GetName().Name != "ScalerCore") continue;
+                foreach (var t in asm.GetTypes())
+                    if (t.Name == "PlayerHandler") { playerHandler = t; break; }
+                if (playerHandler != null) break;
+            }
+            var phOnUpdate = playerHandler != null ? AccessTools.Method(playerHandler, "OnUpdate") : null;
+            if (phOnUpdate != null)
+            {
+                harmony.Patch(phOnUpdate, postfix: new HarmonyMethod(typeof(VoicePitchPatch), nameof(VoicePitchPatch.PlayerHandlerOnUpdatePostfix)));
+                Log.LogInfo($"[Voice] Patched {playerHandler!.FullName}.OnUpdate (per-frame voice pitch fields)");
+            }
+            else
+                Log.LogWarning("[Voice] PlayerHandler.OnUpdate not found");
+
+            // Patch GetGrabFactors → return (1, 1) when PreserveGrabStrength is enabled, so shrunk
+            // players keep full grab strength/range/throw. Without this ScalerCore reduces them
+            // proportionally to scale (e.g. factor 0.4 → 0.6 strength multiplier, 0.4 range).
+            var getGrabFactors = playerHandler != null
+                ? AccessTools.Method(playerHandler, "GetGrabFactors")
+                : null;
+            if (getGrabFactors != null)
+            {
+                harmony.Patch(getGrabFactors, postfix: new HarmonyMethod(typeof(GrabFactorsPatch), nameof(GrabFactorsPatch.Postfix)));
+                Log.LogInfo($"[Strength] Patched {playerHandler!.FullName}.GetGrabFactors");
+            }
+            else
+                Log.LogWarning("[Strength] PlayerHandler.GetGrabFactors not found");
 
             // Revive resets localScale — re-shrink after recovery. Tumble/Hurt patches were tried
             // but ForceShrink mid-tumble destroys ScalerCore's controller and breaks the tumble
@@ -134,6 +178,11 @@ namespace MiniEepo
             ManagedObjects.Add(go.GetInstanceID());
             var opts = ScaleOptions.Default; // ScaleOptions is a struct; this is a safe value copy
             opts.Factor = factor;
+            // Damage-bonk would auto-expand shrunk objects via PlayerBonkPatch — infinite immunity disables it.
+            opts.BonkImmuneDuration = float.PositiveInfinity;
+            // Preserve original mass — without this, items get clamp(originalMass * factor, 0.5, ...)
+            // which makes guns and other items feel droopy/floaty due to reduced inertia.
+            opts.PreserveMass = true;
             IsApplying = true;
             try { ScaleManager.ApplyIfNotScaled(go, opts); }
             finally { IsApplying = false; }
@@ -210,13 +259,21 @@ namespace MiniEepo
             if (target >= 0.99f || !Plugin.IsInGameplay()) return;
             foreach (var pa in Object.FindObjectsOfType<PlayerAvatar>())
             {
-                var s = pa.transform.localScale.x;
+                if (pa == null) continue; // destroyed Unity object
+                Transform paT;
+                try { paT = pa.transform; } catch { continue; }
+                if (paT == null) continue;
+                var s = paT.localScale.x;
                 if (s > 0.9f && s > target + 0.4f)
-                {
-                    // Direct set only. ScaleManager.Apply with same factor would TOGGLE off
-                    // (ScalerCore treats same-factor-on-scaled-object as ShrinkerGun toggle).
-                    pa.transform.localScale = new Vector3(target, target, target);
-                }
+                    paT.localScale = new Vector3(target, target, target);
+                var parent = paT.parent;
+                if (parent == null) continue;
+                Transform? visuals;
+                try { visuals = parent.Find("Player Visuals"); } catch { continue; }
+                if (visuals == null) continue;
+                var vs = visuals.localScale.x;
+                if (vs > 0.9f && vs > target + 0.4f)
+                    visuals.localScale = new Vector3(target, target, target);
             }
         }
 
@@ -279,16 +336,26 @@ private void PullHostSettings()
             bool useShrink = pv == null || pv.IsMine || PhotonNetwork.IsMasterClient;
             if (useShrink)
             {
-                // Owner or master client — use ScalerCore for full effect (animation, mass, RPC).
                 Plugin.Shrink(instance.gameObject, Plugin.ActivePlayerScale);
             }
             else
             {
-                // Non-owner on non-master: ScalerCore refuses to apply non-owned objects, and the
-                // host's RPC may have raced past our handler-registration. Bypass ScalerCore and
-                // direct-multiply the transform — same pattern as items/valuables (which work).
                 if (DirectScaledPlayers.Add(instance.gameObject.GetInstanceID()))
-                    instance.transform.localScale *= Plugin.ActivePlayerScale;
+                {
+                    var current = instance.transform.localScale.x;
+                    if (current > 0.99f)
+                        instance.transform.localScale *= Plugin.ActivePlayerScale;
+                    // Also scale "Player Visuals" — it's a SIBLING of "Player Avatar Controller"
+                    // under "PlayerAvatar(Clone)", and it holds the actual visible character mesh.
+                    // Our root-only scale doesn't propagate to siblings.
+                    var parent = instance.transform.parent;
+                    if (parent != null)
+                    {
+                        var visuals = parent.Find("Player Visuals");
+                        if (visuals != null && visuals.localScale.x > 0.99f)
+                            visuals.localScale *= Plugin.ActivePlayerScale;
+                    }
+                }
             }
         }
 
@@ -364,9 +431,63 @@ private void PullHostSettings()
 
     // Applied manually in Plugin.Awake. Returning false skips ScalerCore's ApplyPitch entirely
     // when VoiceMod is off — pitch is never modified, so audio plays at normal pitch.
+    // Postfix on ScalerCore.PlayerHandler.GetGrabFactors. The original returns (strengthMul, rangeMul)
+    // based on shrink factor — at factor=0.4 it returns ~(0.6, 0.4), nerfing the player's grip.
+    // We override the result with our user-configurable multiplier (default 1.0 = full strength).
+    internal static class GrabFactorsPatch
+    {
+        public static void Postfix(ref System.ValueTuple<float, float> __result)
+        {
+            float m = Plugin.GrabStrength.Value;
+            __result = new System.ValueTuple<float, float>(m, m);
+        }
+    }
+
     internal static class VoicePitchPatch
     {
         public static bool Prefix() => Plugin.ActiveVoiceMod;
+
+        // Reflection cache. HandlerState is INTERNAL on ScaleController (a field, not a property),
+        // so we have to use AccessTools / non-public flags to find it.
+        private const System.Reflection.BindingFlags BF =
+            System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.NonPublic |
+            System.Reflection.BindingFlags.Instance;
+        private static System.Reflection.FieldInfo? _handlerStateField;
+        private static System.Reflection.FieldInfo? _avatarField;
+        private static System.Reflection.FieldInfo? _voiceChatField;
+        private static System.Reflection.FieldInfo? _activeField;
+        private static System.Reflection.FieldInfo? _multField;
+
+        public static void PlayerHandlerOnUpdatePostfix(object ctrl)
+        {
+            if (Plugin.ActiveVoiceMod) return;
+            if (ctrl == null) return;
+            try
+            {
+                _handlerStateField ??= ctrl.GetType().GetField("HandlerState", BF);
+                var state = _handlerStateField?.GetValue(ctrl);
+                if (state == null) return;
+                _avatarField ??= state.GetType().GetField("PlayerAvatar", BF);
+                var avatar = _avatarField?.GetValue(state);
+                // Unity null-check — UnityEngine.Object overrides == to detect destroyed objects.
+                if (avatar is UnityEngine.Object uAvatar && uAvatar == null) return;
+                if (avatar == null) return;
+                _voiceChatField ??= avatar.GetType().GetField("voiceChat", BF);
+                var voiceChat = _voiceChatField?.GetValue(avatar);
+                if (voiceChat is UnityEngine.Object uVc && uVc == null) return;
+                if (voiceChat == null) return;
+                var vt = voiceChat.GetType();
+                _activeField ??= vt.GetField("overridePitchIsActive", BF);
+                _multField ??= vt.GetField("overridePitchMultiplierTarget", BF);
+                _activeField?.SetValue(voiceChat, false);
+                _multField?.SetValue(voiceChat, 1.0f);
+            }
+            catch (System.Exception e)
+            {
+                // Avoid crashing the game during host migration / avatar destruction.
+                Plugin.Log.LogDebug($"[Voice] OnUpdate postfix swallowed: {e.GetType().Name}");
+            }
+        }
     }
 
     // Applied manually in Plugin.Awake for revive method names — re-shrinks after the
