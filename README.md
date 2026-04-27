@@ -6,8 +6,11 @@ A R.E.P.O. mod that shrinks all players, items, and valuables to 40% of their or
 
 - All players, items, and valuables start at configurable tiny size (default 40%)
 - Valuables smoothly shrink further when placed in the extraction cart, then restore when removed
-- Host settings sync to all clients automatically — only the host needs to configure the mod
-- Voice pitch modulation when players are shrunk (toggleable)
+- Held guns are stabilized so shotguns and heavy weapons don't droop out of view
+- Taking damage no longer un-shrinks the player; revive also preserves the shrunk state
+- Items pulled from inventory stay small (no full-size flash on un-pocket)
+- Host scale settings sync to all clients automatically — only the host needs to configure the mod
+- Voice pitch modulation when players are shrunk — each client controls what *they* hear (toggleable per-player)
 - Compatible with [REPOConfig](https://thunderstore.io/c/repo/p/nickklmao/REPOConfig/) — adjust settings in-game via the config menu
 
 ## Configuration
@@ -22,7 +25,7 @@ A R.E.P.O. mod that shrinks all players, items, and valuables to 40% of their or
 
 Config file: `BepInEx/config/darkharasho.MiniEepo.cfg`
 
-In multiplayer, the host's settings apply to all players. Non-host config values are ignored while in a room.
+In multiplayer, the host's scale settings (`PlayerScale`, `ItemScale`, `ValuableScale`, `CartScale`) apply to all players — non-host values for these are ignored while in a room. `VoiceMod` is intentionally local: each client decides whether they hear pitched-up voices.
 
 ## Dependencies
 
@@ -32,3 +35,7 @@ In multiplayer, the host's settings apply to all players. Non-host config values
 ## Installation
 
 Install via [Thunderstore Mod Manager](https://www.overwolf.com/app/Thunderstore-Thunderstore_Mod_Manager) or manually place `MiniEepo.dll` in `BepInEx/plugins/MiniEepo/`.
+
+## Thanks
+
+Big thanks to **Vette** and **Grimm** for testing.
