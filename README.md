@@ -9,6 +9,7 @@ A R.E.P.O. mod that shrinks all players, items, and valuables to 40% of their or
 - Held guns are stabilized so shotguns and heavy weapons don't droop out of view
 - Taking damage no longer un-shrinks the player; revive also preserves the shrunk state
 - Items pulled from inventory stay small (no full-size flash on un-pocket)
+- Shop level is excluded from shrinking by default so items stay readable while you browse — toggleable
 - Host scale settings sync to all clients automatically — only the host needs to configure the mod
 - Voice pitch modulation when players are shrunk — each client controls what *they* hear (toggleable per-player)
 - Compatible with [REPOConfig](https://thunderstore.io/c/repo/p/nickklmao/REPOConfig/) — adjust settings in-game via the config menu
@@ -21,11 +22,12 @@ A R.E.P.O. mod that shrinks all players, items, and valuables to 40% of their or
 | `ItemScale` | `0.4` | `0.1–1.0` | Size multiplier for items |
 | `ValuableScale` | `0.4` | `0.1–1.0` | Size multiplier for valuables |
 | `CartScale` | `1.0` | `0.1–1.0` | Extra shrink applied when a valuable is in the cart (`1.0` = no change, `0.5` = half size) |
+| `ShrinkInShop` | `false` | — | If true, shrinking applies in the shop level too. Default false leaves shop items at normal size. |
 | `VoiceMod` | `true` | — | Enable voice pitch modulation when players are shrunk |
 
 Config file: `BepInEx/config/darkharasho.MiniEepo.cfg`
 
-In multiplayer, the host's scale settings (`PlayerScale`, `ItemScale`, `ValuableScale`, `CartScale`) apply to all players — non-host values for these are ignored while in a room. `VoiceMod` is intentionally local: each client decides whether they hear pitched-up voices.
+In multiplayer, the host's scale settings (`PlayerScale`, `ItemScale`, `ValuableScale`, `CartScale`, `ShrinkInShop`) apply to all players — non-host values for these are ignored while in a room. `VoiceMod` is intentionally local: each client decides whether they hear pitched-up voices.
 
 ## Dependencies
 

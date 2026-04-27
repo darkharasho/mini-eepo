@@ -12,6 +12,10 @@ namespace MiniEepo
 {
     [BepInPlugin(PluginInfo.PLUGIN_GUID, PluginInfo.PLUGIN_NAME, PluginInfo.PLUGIN_VERSION)]
     [BepInDependency("Vippy.ScalerCore", BepInDependency.DependencyFlags.HardDependency)]
+    // Soft-depend on SolidAim so it loads first when present — our Awake checks for it to skip
+    // our redundant held-gun stabilization. Without this, BepInEx may load us first and the
+    // detection misses, leaving both mods stabilizing every PGO every FixedUpdate.
+    [BepInDependency("Jangnana.SolidAim", BepInDependency.DependencyFlags.SoftDependency)]
     public class Plugin : BaseUnityPlugin
     {
         internal static ManualLogSource Log = null!;
@@ -20,6 +24,7 @@ namespace MiniEepo
         internal static ConfigEntry<float> ValuableScale = null!;
         internal static ConfigEntry<float> CartScale = null!;
         internal static ConfigEntry<bool> VoiceMod = null!;
+        internal static ConfigEntry<bool> ShrinkInShop = null!;
 
         // Active values — start from local config, overridden by host sync
         internal static float ActivePlayerScale;
@@ -27,6 +32,7 @@ namespace MiniEepo
         internal static float ActiveValuableScale;
         internal static float ActiveCartScale;
         internal static bool ActiveVoiceMod;
+        internal static bool ActiveShrinkInShop;
 
         private void Awake()
         {
@@ -46,11 +52,21 @@ namespace MiniEepo
             VoiceMod = Config.Bind("Audio", "VoiceMod", true,
                 new ConfigDescription("Enable voice pitch modulation when players are shrunk"));
 
+            ShrinkInShop = Config.Bind("Scaling", "ShrinkInShop", false,
+                new ConfigDescription("If true, shrinking applies in the shop level too. Default false — items stay normal size while shopping."));
+
             ResetToLocalConfig();
 
-            // Keep ActiveVoiceMod in sync when the user changes the toggle at runtime via
-            // REPOConfig. Without this, the patches keep using the startup value forever.
+            // Keep Active* values in sync when the user changes config at runtime (e.g. via
+            // REPOConfig). Without these, the values captured at startup are used forever
+            // — the host would also keep pushing the original room-entry values to clients.
+            // Scale configs additionally re-push from the host so non-host clients update too.
             VoiceMod.SettingChanged += (_, _) => ActiveVoiceMod = VoiceMod.Value;
+            PlayerScale.SettingChanged   += (_, _) => OnHostScaleConfigChanged();
+            ItemScale.SettingChanged     += (_, _) => OnHostScaleConfigChanged();
+            ValuableScale.SettingChanged += (_, _) => OnHostScaleConfigChanged();
+            CartScale.SettingChanged     += (_, _) => OnHostScaleConfigChanged();
+            ShrinkInShop.SettingChanged  += (_, _) => OnHostScaleConfigChanged();
 
             // Attach SettingsSyncer to our own plugin GameObject (BepInEx keeps it alive across
             // scenes). A fresh GameObject didn't reliably get its Start callback fired.
@@ -143,6 +159,18 @@ namespace MiniEepo
                 Log.LogInfo($"[Revive] Patched {name}");
             }
 
+            // If SolidAim is loaded it already does our held-gun stabilization (we mirror their
+            // approach). Skip registering ours so PhysGrabObject.FixedUpdate doesn't pay Harmony
+            // invocation overhead per PGO at 50Hz.
+            if (BepInEx.Bootstrap.Chainloader.PluginInfos.ContainsKey("Jangnana.SolidAim"))
+                Log.LogInfo("[Stabilize] SolidAim detected — skipping built-in held-gun stabilization");
+            else
+            {
+                var pgoFixed = AccessTools.Method(typeof(PhysGrabObject), "FixedUpdate");
+                if (pgoFixed != null)
+                    harmony.Patch(pgoFixed, postfix: new HarmonyMethod(typeof(HeldGunStabilizationPatch), nameof(HeldGunStabilizationPatch.Postfix)));
+            }
+
             Log.LogInfo($"MiniEepo v{PluginInfo.PLUGIN_VERSION} loaded — everything is tiny now.");
         }
 
@@ -153,11 +181,23 @@ namespace MiniEepo
             ActiveValuableScale = ValuableScale.Value;
             ActiveCartScale     = CartScale.Value;
             ActiveVoiceMod      = VoiceMod.Value;
+            ActiveShrinkInShop  = ShrinkInShop.Value;
         }
 
-        // True when REPO is in an actual gameplay level — not the main menu, not the truck/lobby.
-        // Uses RunManager's level tracking (REPO loads levels additively, so SceneManager.activeScene
-        // stays "Level - Lobby Menu" the whole time and isn't reliable here).
+        // Re-apply local config values, then re-push to room properties if we're host so non-host
+        // clients pick up the change. Non-host changes only affect singleplayer; in a room the
+        // host's values win and the next pull will overwrite ours.
+        private static void OnHostScaleConfigChanged()
+        {
+            if (PhotonNetwork.InRoom && !PhotonNetwork.IsMasterClient) return;
+            ResetToLocalConfig();
+            SettingsSyncer.Instance?.PushHostSettingsExternal();
+        }
+
+        // True when REPO is in an actual gameplay level — not the main menu, not the truck/lobby,
+        // and (unless ShrinkInShop is on) not the shop. Uses RunManager's level tracking — REPO
+        // loads levels additively so SceneManager.activeScene stays "Level - Lobby Menu" the
+        // whole time and isn't reliable here.
         internal static bool IsInGameplay()
         {
             // Also require being in a Photon room — at game startup RunManager.levelCurrent has a
@@ -167,7 +207,9 @@ namespace MiniEepo
             if (rm == null) return false;
             var current = rm.levelCurrent;
             if (current == null) return false;
-            return current != rm.levelLobby && current != rm.levelLobbyMenu;
+            if (current == rm.levelLobby || current == rm.levelLobbyMenu) return false;
+            if (current == rm.levelShop && !ActiveShrinkInShop) return false;
+            return true;
         }
 
         internal static readonly HashSet<int> ManagedObjects = new HashSet<int>();
@@ -198,6 +240,7 @@ namespace MiniEepo
         private const string K_ITEM     = "ME_IS";
         private const string K_VALUABLE = "ME_VS";
         private const string K_CART     = "ME_CS";
+        private const string K_SHOP     = "ME_SS"; // ShrinkInShop toggle
 
         // Static singleton — FindObjectOfType doesn't reliably find us when attached to the BepInEx
         // plugin GameObject (which lives outside the normal scene hierarchy).
@@ -250,44 +293,48 @@ namespace MiniEepo
             _wasMaster = master;
         }
 
+        // Watcher runs at ~4Hz (every 0.25s) instead of every frame. Items only reset scale on
+        // un-pocket, players on damage/revive — none need sub-frame correction. FindObjectsOfType
+        // is O(all scene objects) and was the main FPS hit on heavy modpacks.
+        private float _watcherTimer;
+
+        // Cache the "Player Visuals" sibling per avatar so the watcher doesn't call
+        // Transform.Find every tick — it's the same Transform for the avatar's lifetime.
+        private readonly Dictionary<int, Transform?> _visualsCache = new Dictionary<int, Transform?>();
+
         private void LateUpdate()
         {
             if (!Plugin.IsInGameplay()) return;
+            _watcherTimer -= Time.deltaTime;
+            if (_watcherTimer > 0f) return;
+            _watcherTimer = 0.25f;
 
-            // Player + their visible body sibling.
+            // Player + their visible body sibling. Use GameDirector.PlayerList instead of
+            // FindObjectsOfType — it's a maintained roster, not a scene scan.
             float pTarget = Plugin.ActivePlayerScale;
-            if (pTarget < 0.99f)
+            if (pTarget < 0.99f && GameDirector.instance?.PlayerList != null)
             {
-                foreach (var pa in Object.FindObjectsOfType<PlayerAvatar>())
+                foreach (var pa in GameDirector.instance.PlayerList)
                 {
                     if (pa == null) continue;
                     var paT = pa.transform;
                     if (paT.localScale.x > 0.9f && paT.localScale.x > pTarget + 0.4f)
                         paT.localScale = new Vector3(pTarget, pTarget, pTarget);
-                    var visuals = paT.parent != null ? paT.parent.Find("Player Visuals") : null;
+                    int id = pa.GetInstanceID();
+                    if (!_visualsCache.TryGetValue(id, out var visuals) || visuals == null)
+                    {
+                        visuals = paT.parent != null ? paT.parent.Find("Player Visuals") : null;
+                        _visualsCache[id] = visuals;
+                    }
                     if (visuals != null && visuals.localScale.x > 0.9f && visuals.localScale.x > pTarget + 0.4f)
                         visuals.localScale = new Vector3(pTarget, pTarget, pTarget);
                 }
             }
 
-            // Items — un-pocketing from inventory resets scale back to 1.0 but ScalerCore's
-            // controller still thinks IsScaled=true. Direct-set the scale instead of going
-            // through Restore+Shrink (which animates 0.4→1.0→0.4 and produces a visible flash
-            // when guns are pulled from inventory). ScalerCore's per-frame OnLateUpdate also
-            // forces _t.localScale = _target while IsScaled, so this is consistent with that.
-            float iTarget = Plugin.ActiveItemScale;
-            if (iTarget < 0.99f)
-            {
-                foreach (var equip in Object.FindObjectsOfType<ItemEquippable>())
-                {
-                    if (equip == null) continue;
-                    var attrs = equip.GetComponentInParent<ItemAttributes>(includeInactive: true);
-                    GameObject target = attrs != null ? attrs.gameObject : equip.gameObject;
-                    var s = target.transform.localScale.x;
-                    if (s > 0.9f && s > iTarget + 0.4f)
-                        target.transform.localScale = new Vector3(iTarget, iTarget, iTarget);
-                }
-            }
+            // Items removed from this watcher — un-pocket events are now caught directly via
+            // a Harmony postfix on ItemEquippable.RPC_CompleteUnequip (see UnequipReshrinkPatch).
+            // That re-shrinks only the specific item that just came out, eliminating the
+            // periodic GetComponentInParent iteration that was contributing to frame stutter.
         }
 
         private void PullHostSettings()
@@ -299,23 +346,48 @@ namespace MiniEepo
             if (props.ContainsKey(K_ITEM))     { var v = (float)props[K_ITEM];     if (Plugin.ActiveItemScale     != v) { Plugin.ActiveItemScale     = v; changed = true; } }
             if (props.ContainsKey(K_VALUABLE)) { var v = (float)props[K_VALUABLE]; if (Plugin.ActiveValuableScale != v) { Plugin.ActiveValuableScale = v; changed = true; } }
             if (props.ContainsKey(K_CART))     { var v = (float)props[K_CART];     if (Plugin.ActiveCartScale     != v) { Plugin.ActiveCartScale     = v; changed = true; } }
+            if (props.ContainsKey(K_SHOP))     { var v = (bool)props[K_SHOP];      if (Plugin.ActiveShrinkInShop  != v) { Plugin.ActiveShrinkInShop  = v; changed = true; } }
             if (changed)
-                Plugin.Log.LogInfo($"[Sync] Pulled host settings — player={Plugin.ActivePlayerScale} item={Plugin.ActiveItemScale} valuable={Plugin.ActiveValuableScale} cart={Plugin.ActiveCartScale}");
+                Plugin.Log.LogInfo($"[Sync] Pulled host settings — player={Plugin.ActivePlayerScale} item={Plugin.ActiveItemScale} valuable={Plugin.ActiveValuableScale} cart={Plugin.ActiveCartScale} shrinkInShop={Plugin.ActiveShrinkInShop}");
         }
+
+        // Public entry point for runtime config changes (REPOConfig sliders, etc.) — only valid
+        // when the host actually has a room to push into.
+        internal void PushHostSettingsExternal()
+        {
+            if (!PhotonNetwork.InRoom || !PhotonNetwork.IsMasterClient) return;
+            PushHostSettings();
+        }
+
+        // Cache last-pushed values so we don't broadcast a Photon CustomProperties update when
+        // SettingChanged fires but values are identical. Some config systems (REPOConfig, etc.)
+        // re-emit SettingChanged on autosave even without a real change — without this guard
+        // we'd spam the room with broadcasts every few seconds.
+        private float _lastPushedPlayer = float.NaN, _lastPushedItem = float.NaN;
+        private float _lastPushedValuable = float.NaN, _lastPushedCart = float.NaN;
+        private bool? _lastPushedShop;
 
         private void PushHostSettings()
         {
             if (PhotonNetwork.CurrentRoom == null) return;
+            float p = Plugin.PlayerScale.Value, i = Plugin.ItemScale.Value;
+            float v = Plugin.ValuableScale.Value, c = Plugin.CartScale.Value;
+            bool s = Plugin.ShrinkInShop.Value;
+            if (p == _lastPushedPlayer && i == _lastPushedItem &&
+                v == _lastPushedValuable && c == _lastPushedCart && s == _lastPushedShop)
+            {
+                Plugin.ResetToLocalConfig(); // still refresh Active mirrors, but skip broadcast
+                return;
+            }
+            _lastPushedPlayer = p; _lastPushedItem = i;
+            _lastPushedValuable = v; _lastPushedCart = c; _lastPushedShop = s;
             var props = new ExitGames.Client.Photon.Hashtable
             {
-                [K_PLAYER]   = Plugin.PlayerScale.Value,
-                [K_ITEM]     = Plugin.ItemScale.Value,
-                [K_VALUABLE] = Plugin.ValuableScale.Value,
-                [K_CART]     = Plugin.CartScale.Value,
+                [K_PLAYER] = p, [K_ITEM] = i, [K_VALUABLE] = v, [K_CART] = c, [K_SHOP] = s,
             };
             PhotonNetwork.CurrentRoom.SetCustomProperties(props);
             Plugin.ResetToLocalConfig();
-            Plugin.Log.LogInfo($"[Sync] Host pushed settings — player={Plugin.PlayerScale.Value} item={Plugin.ItemScale.Value} valuable={Plugin.ValuableScale.Value} cart={Plugin.CartScale.Value}");
+            Plugin.Log.LogInfo($"[Sync] Host pushed settings — player={p} item={i} valuable={v} cart={c} shrinkInShop={s}");
         }
 
         private IEnumerator RescaleAfterJoin()
@@ -426,6 +498,11 @@ namespace MiniEepo
 
         private static void Postfix(PhysGrabObject __instance)
         {
+            // Skip shop level (and lobby) — items stay normal size unless ShrinkInShop is on.
+            // Items the player carries from shop into gameplay get caught by RescaleAfterJoin
+            // when the level transitions, so we don't lose them.
+            if (!Plugin.IsInGameplay()) return;
+
             GameObject? target = null;
             // ItemAttributes above the PhysGrabObject — original hierarchy; scale from that root.
             var attrsAbove = __instance.GetComponentInParent<ItemAttributes>(includeInactive: true);
@@ -454,6 +531,9 @@ namespace MiniEepo
 
         private static void Postfix(ValuableObject __instance)
         {
+            // Skip shop level — valuables shouldn't shrink while shopping.
+            if (!Plugin.IsInGameplay()) return;
+
             int id = __instance.gameObject.GetInstanceID();
             if (!_scaled.Add(id)) return;
             __instance.transform.localScale *= Plugin.ActiveValuableScale;
@@ -490,6 +570,11 @@ namespace MiniEepo
         private static System.Reflection.FieldInfo? _voiceChatField;
         private static System.Reflection.FieldInfo? _activeField;
         private static System.Reflection.FieldInfo? _multField;
+        // Pre-boxed values so per-frame SetValue calls don't allocate. Reflection's
+        // SetValue(object, value-type) boxes the value each call — at multiple players × 60fps
+        // that's hundreds of allocs/sec and a GC stutter every few seconds.
+        private static readonly object _boxedFalse = false;
+        private static readonly object _boxedOne = 1.0f;
 
         public static void PlayerHandlerOnUpdatePostfix(object ctrl)
         {
@@ -512,8 +597,8 @@ namespace MiniEepo
                 var vt = voiceChat.GetType();
                 _activeField ??= vt.GetField("overridePitchIsActive", BF);
                 _multField ??= vt.GetField("overridePitchMultiplierTarget", BF);
-                _activeField?.SetValue(voiceChat, false);
-                _multField?.SetValue(voiceChat, 1.0f);
+                _activeField?.SetValue(voiceChat, _boxedFalse);
+                _multField?.SetValue(voiceChat, _boxedOne);
             }
             catch (System.Exception e)
             {
@@ -535,15 +620,43 @@ namespace MiniEepo
         }
     }
 
+    // Re-shrink an item the moment it's un-pocketed from inventory. This is the only place an
+    // already-shrunk item resets its localScale back to 1.0, so hooking the un-pocket RPC lets
+    // us catch it without polling every item every frame. Wait one frame for the un-equip
+    // animation to settle before snapping the scale.
+    [HarmonyPatch(typeof(ItemEquippable), "RPC_CompleteUnequip")]
+    internal static class UnequipReshrinkPatch
+    {
+        static void Postfix(ItemEquippable __instance)
+        {
+            if (Plugin.ActiveItemScale >= 0.99f) return;
+            __instance.StartCoroutine(Reshrink(__instance));
+        }
+
+        private static IEnumerator Reshrink(ItemEquippable equip)
+        {
+            yield return null;
+            if (equip == null) yield break;
+            var attrs = equip.GetComponentInParent<ItemAttributes>(includeInactive: true);
+            GameObject target = attrs != null ? attrs.gameObject : equip.gameObject;
+            float t = Plugin.ActiveItemScale;
+            if (target.transform.localScale.x > 0.9f && target.transform.localScale.x > t + 0.4f)
+                target.transform.localScale = new Vector3(t, t, t);
+        }
+    }
+
     // SolidAim-style stabilization for held guns when the local player is shrunk. Without this,
     // shotguns/heavy guns droop because the grab spring isn't strong enough vs gravity torque
     // for a 40%-scale player whose grab strength is reduced. Applies override-mass + override-
     // grab-strength + rotation slerp toward camera every FixedUpdate (overrides are timed at
     // 0.1s so they need re-application). Mirrors jangnana/SolidAim's ApplyAimStabilization.
-    [HarmonyPatch(typeof(PhysGrabObject), "FixedUpdate")]
+    //
+    // No [HarmonyPatch] attribute — registered manually in Plugin.Awake only when SolidAim is
+    // absent. Otherwise PhysGrabObject.FixedUpdate fires per PGO at 50Hz and even an early-return
+    // postfix has Harmony invocation overhead worth avoiding on heavy scenes.
     internal static class HeldGunStabilizationPatch
     {
-        static void Postfix(PhysGrabObject __instance)
+        internal static void Postfix(PhysGrabObject __instance)
         {
             var local = SemiFunc.PlayerAvatarLocal();
             if (local == null) return;
