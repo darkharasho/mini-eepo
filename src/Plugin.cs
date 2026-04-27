@@ -680,30 +680,24 @@ namespace MiniEepo
         }
     }
 
-    // PhysGrabber.StartGrabbingPhysObject hardcodes a `- camera.up * 0.3` offset on the puller
-    // position when grabbing forceGrabPoint items (guns, melee). That 0.3 is in world units and
-    // doesn't scale — for a shrunk player (~0.6 eye height) it puts the puller near the floor,
-    // so guns drop out of view. Add back most of that offset proportionally to player scale so
-    // the puller stays in front of the shrunken eye line.
+    // ScalerCore's GrabVerticalPositionScalePatch handles puller height correctly for valuables,
+    // but guns still droop because the baked-in `- camera.up * 0.3` offset on forceGrabPoint items
+    // pulls them below the shrunken eye line. Re-lift only for guns so valuables keep ScalerCore's
+    // natural feel.
     [HarmonyPatch(typeof(PhysGrabber), "StartGrabbingPhysObject")]
-    internal static class GrabPullerOffsetFix
+    internal static class GrabPullerOffsetFixForGuns
     {
-        private static System.Reflection.FieldInfo? _camField;
-
-        static void Postfix(PhysGrabber __instance)
+        static void Postfix(PhysGrabber __instance, PhysGrabObject ___grabbedPhysGrabObject)
         {
             var pa = __instance.playerAvatar;
             if (pa == null) return;
-            float scale = pa.transform.localScale.x;
-            if (scale > 0.99f) return; // not shrunk
+            if (pa.transform.localScale.x > 0.99f) return; // not shrunk
+            var grabbed = ___grabbedPhysGrabObject;
+            if (grabbed == null || grabbed.GetComponent<ItemGun>() == null) return;
             var puller = __instance.physGrabPointPuller;
             if (puller == null) return;
-            _camField ??= AccessTools.Field(typeof(PhysGrabber), "playerCamera");
-            var cam = _camField?.GetValue(__instance) as Camera;
+            var cam = Camera.main;
             if (cam == null) return;
-            // Cancel the baked-in -0.3 world-unit down-offset entirely. For shrunk players the
-            // camera is still at near-full-size eye height (capsule unchanged), so any constant
-            // down-offset puts the gun out of FOV. Lift by the full 0.3.
             Vector3 lift = cam.transform.up * 0.3f;
             puller.position += lift;
             __instance.physGrabPointPlane.position += lift;
