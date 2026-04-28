@@ -328,6 +328,13 @@ namespace MiniEepo
                     }
                     if (visuals != null && visuals.localScale.x > 0.9f && visuals.localScale.x > pTarget + 0.4f)
                         visuals.localScale = new Vector3(pTarget, pTarget, pTarget);
+
+                    // Apply CCD to tumble rigidbodies once we observe the avatar at shrunk scale.
+                    // Catches the case where PlayerTumble.Start ran before the shrink landed
+                    // (e.g. ShrinkerGun mid-game shrink, or the shrink coroutine racing tumble Start).
+                    // Internally idempotent + cached, so repeated 4Hz calls are cheap.
+                    if (paT.localScale.x < 0.99f)
+                        TumbleCcdPatch.ApplyToAvatarTumble(pa);
                 }
             }
 
@@ -511,10 +518,27 @@ namespace MiniEepo
                 target = __instance.gameObject;
             if (target == null) return;
 
+            // Equippables that aren't guns (melee, grenades, batons, etc.) get direct localScale
+            // instead of the full ScalerCore path. ScalerCore registers a controller and tracks
+            // these per-frame, which spiked frame time the moment a melee weapon spawned —
+            // baguette / sledgehammer / etc. carry extra hitbox colliders and rigidbodies that
+            // are expensive to re-bake. Direct scale keeps them visually shrunk without the
+            // tracking overhead. Guns stay on the ScalerCore path because the gun-specific
+            // stabilization + puller-lift patches assume that controller is registered.
+            // ItemEquippable may sit on a child of the ItemAttributes GO, so search the whole
+            // subtree. Same for ItemGun — if it's anywhere under target, treat as gun and keep
+            // the full ScalerCore path.
+            bool hasEquippable = target.GetComponentInChildren<ItemEquippable>(includeInactive: true) != null;
+            bool hasGun = target.GetComponentInChildren<ItemGun>(includeInactive: true) != null;
+            bool isNonGunEquippable = hasEquippable && !hasGun;
+
             // ScalerCore's ItemHandler doesn't sync via RPC (only PlayerHandler/CartHandler do) and
             // refuses to scale objects the local client doesn't own. On non-host, fall back to direct
             // localScale multiplication so items still appear small.
-            if (PhotonNetwork.InRoom && !PhotonNetwork.IsMasterClient)
+            bool useDirectScale = isNonGunEquippable ||
+                (PhotonNetwork.InRoom && !PhotonNetwork.IsMasterClient);
+
+            if (useDirectScale)
             {
                 if (DirectScaledItems.Add(target.GetInstanceID()))
                     target.transform.localScale *= Plugin.ActiveItemScale;
@@ -608,6 +632,51 @@ namespace MiniEepo
         }
     }
 
+    // Tumble bodies tunnel through thin geometry when the player is shrunk — small collider +
+    // ragdoll spin + fixed-timestep gaps = collider passes through the floor between ticks. Modded
+    // maps with thin meshes hit this constantly. Bump every tumble rigidbody's collision detection
+    // to ContinuousDynamic so Unity's solver does swept-volume checks instead of point-in-polygon
+    // per tick. Only applied to shrunk players' tumbles — full-size vanilla physics is unchanged.
+    [HarmonyPatch(typeof(PlayerTumble), "Start")]
+    internal static class TumbleCcdPatch
+    {
+        static void Postfix(PlayerTumble __instance)
+        {
+            var pa = __instance.playerAvatar;
+            if (pa == null) return;
+            if (pa.transform.localScale.x > 0.99f) return; // not shrunk — leave vanilla CCD alone
+
+            ApplyCcd(__instance);
+        }
+
+        // PlayerTumble instance ids we've already applied CCD to. PlayerTumble lives for the
+        // lifetime of the avatar, so once we've walked its rigidbody tree once we don't need to
+        // again. Without this guard the SettingsSyncer 4Hz watcher would re-walk every tick.
+        private static readonly HashSet<int> _ccdApplied = new HashSet<int>();
+
+        // Re-apply if the player gets shrunk AFTER tumble Start has already run (e.g. ShrinkerGun
+        // hits them mid-run, or the shrink coroutine raced PlayerTumble.Start).
+        internal static void ApplyToAvatarTumble(PlayerAvatar pa)
+        {
+            if (pa == null) return;
+            var tumble = pa.GetComponentInChildren<PlayerTumble>(includeInactive: true);
+            if (tumble != null) ApplyCcd(tumble);
+        }
+
+        private static void ApplyCcd(PlayerTumble tumble)
+        {
+            if (!_ccdApplied.Add(tumble.GetInstanceID())) return;
+            foreach (var rb in tumble.GetComponentsInChildren<Rigidbody>(includeInactive: true))
+            {
+                // ContinuousDynamic catches collisions vs both static and dynamic CCD-enabled
+                // colliders. Continuous (without Dynamic) only sweeps vs static — fine for floors,
+                // misses moving platforms.
+                if (rb.collisionDetectionMode != CollisionDetectionMode.ContinuousDynamic)
+                    rb.collisionDetectionMode = CollisionDetectionMode.ContinuousDynamic;
+            }
+        }
+    }
+
     // Applied manually in Plugin.Awake for revive method names — re-shrinks after the
     // animation that resets localScale. Direct-sets transform.localScale (no ForceShrink, which
     // would DestroyImmediate ScalerCore's controller and break its tracking mid-animation).
@@ -656,16 +725,29 @@ namespace MiniEepo
     // postfix has Harmony invocation overhead worth avoiding on heavy scenes.
     internal static class HeldGunStabilizationPatch
     {
+        // Cache ItemGun presence per PGO. GetComponent allocates and is the most expensive check
+        // here; ItemGun never appears/disappears on a live PGO, so look it up once and reuse.
+        // Without this cache, every melee weapon / valuable / prop pays a GetComponent on every
+        // FixedUpdate (50Hz) — heavy levels and segmented melee items tanked frame time.
+        private static readonly Dictionary<int, bool> _isGun = new Dictionary<int, bool>();
+
         internal static void Postfix(PhysGrabObject __instance)
         {
+            // Cheapest/most-discriminating check first: most PGOs aren't guns, so reject them
+            // before touching SemiFunc or any list scans.
+            int id = __instance.GetInstanceID();
+            if (!_isGun.TryGetValue(id, out bool isGun))
+            {
+                isGun = __instance.GetComponent<ItemGun>() != null;
+                _isGun[id] = isGun;
+            }
+            if (!isGun) return;
+
             var local = SemiFunc.PlayerAvatarLocal();
             if (local == null) return;
             float scale = local.transform.localScale.x;
             if (scale > 0.99f) return; // not shrunk — let vanilla physics run
             if (!__instance.playerGrabbing.Contains(local.physGrabber)) return;
-
-            var gun = __instance.GetComponent<ItemGun>();
-            if (gun == null) return; // only stabilize guns; other items keep vanilla feel
 
             __instance.OverrideMass(0.25f, 0.1f);
             __instance.OverrideGrabStrength(2f, 0.1f);
