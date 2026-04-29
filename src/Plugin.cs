@@ -338,10 +338,25 @@ namespace MiniEepo
                 }
             }
 
-            // Items removed from this watcher — un-pocket events are now caught directly via
-            // a Harmony postfix on ItemEquippable.RPC_CompleteUnequip (see UnequipReshrinkPatch).
-            // That re-shrinks only the specific item that just came out, eliminating the
-            // periodic GetComponentInParent iteration that was contributing to frame stutter.
+            // Re-snap direct-scaled items whose localScale drifted back to 1. Equip RPCs on
+            // observer clients re-parent the item to a held-position transform and reset its
+            // localScale, so the one-shot shrink in PhysGrabObjectPatch wears off — the holder
+            // sees it small (their copy stays scaled), other players see it big (theirs got reset).
+            // Iterating only items we already direct-scaled is bounded; no scene scan.
+            float iTarget = Plugin.ActiveItemScale;
+            if (iTarget < 0.99f && PhysGrabObjectPatch.DirectScaledItems.Count > 0)
+            {
+                List<int>? dead = null;
+                foreach (var kv in PhysGrabObjectPatch.DirectScaledItems)
+                {
+                    var t = kv.Value;
+                    if (t == null) { (dead ??= new List<int>()).Add(kv.Key); continue; }
+                    if (t.localScale.x > 0.9f && t.localScale.x > iTarget + 0.4f)
+                        t.localScale = new Vector3(iTarget, iTarget, iTarget);
+                }
+                if (dead != null)
+                    foreach (var id in dead) PhysGrabObjectPatch.DirectScaledItems.Remove(id);
+            }
         }
 
         private void PullHostSettings()
@@ -500,8 +515,10 @@ namespace MiniEepo
     [HarmonyPatch(typeof(PhysGrabObject), "Start")]
     internal static class PhysGrabObjectPatch
     {
-        // Track non-host direct-scale items by instance id, so RescaleAfterJoin doesn't double-apply.
-        internal static readonly HashSet<int> DirectScaledItems = new HashSet<int>();
+        // Track direct-scale items so RescaleAfterJoin doesn't double-apply, and so the 4Hz
+        // syncer can re-snap any whose localScale drifted back to 1 (equip animations on remote
+        // clients re-parent the item and reset transform, undoing our one-shot scale).
+        internal static readonly Dictionary<int, Transform> DirectScaledItems = new Dictionary<int, Transform>();
 
         private static void Postfix(PhysGrabObject __instance)
         {
@@ -540,8 +557,12 @@ namespace MiniEepo
 
             if (useDirectScale)
             {
-                if (DirectScaledItems.Add(target.GetInstanceID()))
+                int targetId = target.GetInstanceID();
+                if (!DirectScaledItems.ContainsKey(targetId))
+                {
+                    DirectScaledItems[targetId] = target.transform;
                     target.transform.localScale *= Plugin.ActiveItemScale;
+                }
                 return;
             }
             Plugin.Shrink(target, Plugin.ActiveItemScale);
