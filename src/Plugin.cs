@@ -574,7 +574,22 @@ namespace MiniEepo
 
             int id = __instance.gameObject.GetInstanceID();
             if (!_scaled.Add(id)) return;
-            __instance.transform.localScale *= Plugin.ActiveValuableScale;
+
+            // Host: route through ScalerCore's ValuableHandler so PhysGrabObject mass / grab /
+            // impact params get rescaled alongside the visual transform. Direct localScale shrinks
+            // colliders but leaves those metadata values at full size, which throws off REPO's
+            // hit-knockdown thresholds — players hit by shrunk valuables wouldn't tumble, and the
+            // collider mismatch made fast-thrown valuables tunnel through shrunk players.
+            // REPO's hit detection is host-authoritative, so the host's PhysGrabObject params are
+            // what matter for gameplay.
+            //
+            // Non-host: keep direct localScale. ScalerCore's handlers refuse to scale objects the
+            // local client doesn't own; routing through Plugin.Shrink there would no-op and leave
+            // the valuable at full size visually.
+            if (PhotonNetwork.InRoom && !PhotonNetwork.IsMasterClient)
+                __instance.transform.localScale *= Plugin.ActiveValuableScale;
+            else
+                Plugin.Shrink(__instance.gameObject, Plugin.ActiveValuableScale);
 
             // Always attach the tracker — the gate on ActiveCartScale is in OnTriggerEnter so it
             // works even when valuables spawn before the host's settings sync arrives.
