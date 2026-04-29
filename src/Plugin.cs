@@ -328,13 +328,6 @@ namespace MiniEepo
                     }
                     if (visuals != null && visuals.localScale.x > 0.9f && visuals.localScale.x > pTarget + 0.4f)
                         visuals.localScale = new Vector3(pTarget, pTarget, pTarget);
-
-                    // Apply CCD to tumble rigidbodies once we observe the avatar at shrunk scale.
-                    // Catches the case where PlayerTumble.Start ran before the shrink landed
-                    // (e.g. ShrinkerGun mid-game shrink, or the shrink coroutine racing tumble Start).
-                    // Internally idempotent + cached, so repeated 4Hz calls are cheap.
-                    if (paT.localScale.x < 0.99f)
-                        TumbleCcdPatch.ApplyToAvatarTumble(pa);
                 }
             }
 
@@ -649,53 +642,6 @@ namespace MiniEepo
             {
                 // Avoid crashing the game during host migration / avatar destruction.
                 Plugin.Log.LogDebug($"[Voice] OnUpdate postfix swallowed: {e.GetType().Name}");
-            }
-        }
-    }
-
-    // Tumble bodies tunnel through thin geometry when the player is shrunk — small collider +
-    // ragdoll spin + fixed-timestep gaps = collider passes through the floor between ticks. Modded
-    // maps with thin meshes hit this constantly. Bump the tumble rigidbody's collision detection
-    // to Continuous so Unity's solver sweeps against static colliders (floors/walls — the actual
-    // tunneling case) instead of point-in-polygon per tick. Only applied to the LOCAL shrunk
-    // player — remote avatars are interpolated, so tunneling there is cosmetic and not worth the
-    // CCD cost across a full lobby. Continuous (vs ContinuousDynamic) keeps cost down because it
-    // only sweeps vs static geometry.
-    [HarmonyPatch(typeof(PlayerTumble), "Start")]
-    internal static class TumbleCcdPatch
-    {
-        static void Postfix(PlayerTumble __instance)
-        {
-            var pa = __instance.playerAvatar;
-            if (pa == null) return;
-            if (pa != SemiFunc.PlayerAvatarLocal()) return; // local player only
-            if (pa.transform.localScale.x > 0.99f) return; // not shrunk — leave vanilla CCD alone
-
-            ApplyCcd(__instance);
-        }
-
-        // PlayerTumble instance ids we've already applied CCD to. PlayerTumble lives for the
-        // lifetime of the avatar, so once we've walked its rigidbody tree once we don't need to
-        // again. Without this guard the SettingsSyncer 4Hz watcher would re-walk every tick.
-        private static readonly HashSet<int> _ccdApplied = new HashSet<int>();
-
-        // Re-apply if the player gets shrunk AFTER tumble Start has already run (e.g. ShrinkerGun
-        // hits them mid-run, or the shrink coroutine raced PlayerTumble.Start).
-        internal static void ApplyToAvatarTumble(PlayerAvatar pa)
-        {
-            if (pa == null) return;
-            if (pa != SemiFunc.PlayerAvatarLocal()) return; // local player only
-            var tumble = pa.GetComponentInChildren<PlayerTumble>(includeInactive: true);
-            if (tumble != null) ApplyCcd(tumble);
-        }
-
-        private static void ApplyCcd(PlayerTumble tumble)
-        {
-            if (!_ccdApplied.Add(tumble.GetInstanceID())) return;
-            foreach (var rb in tumble.GetComponentsInChildren<Rigidbody>(includeInactive: true))
-            {
-                if (rb.collisionDetectionMode != CollisionDetectionMode.Continuous)
-                    rb.collisionDetectionMode = CollisionDetectionMode.Continuous;
             }
         }
     }
