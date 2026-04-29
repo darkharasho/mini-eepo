@@ -1,6 +1,6 @@
 {
     "name": "MiniEepo",
-    "version_number": "1.2.7",
+    "version_number": "1.2.8",
     "website_url": "https://github.com/darkharasho/mini-eepo",
     "description": "Shrinks all players, items, and valuables to 40% size. Everyone starts the round tiny.",
     "dependencies": [

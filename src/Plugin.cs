@@ -634,9 +634,12 @@ namespace MiniEepo
 
     // Tumble bodies tunnel through thin geometry when the player is shrunk — small collider +
     // ragdoll spin + fixed-timestep gaps = collider passes through the floor between ticks. Modded
-    // maps with thin meshes hit this constantly. Bump every tumble rigidbody's collision detection
-    // to ContinuousDynamic so Unity's solver does swept-volume checks instead of point-in-polygon
-    // per tick. Only applied to shrunk players' tumbles — full-size vanilla physics is unchanged.
+    // maps with thin meshes hit this constantly. Bump the tumble rigidbody's collision detection
+    // to Continuous so Unity's solver sweeps against static colliders (floors/walls — the actual
+    // tunneling case) instead of point-in-polygon per tick. Only applied to the LOCAL shrunk
+    // player — remote avatars are interpolated, so tunneling there is cosmetic and not worth the
+    // CCD cost across a full lobby. Continuous (vs ContinuousDynamic) keeps cost down because it
+    // only sweeps vs static geometry.
     [HarmonyPatch(typeof(PlayerTumble), "Start")]
     internal static class TumbleCcdPatch
     {
@@ -644,6 +647,7 @@ namespace MiniEepo
         {
             var pa = __instance.playerAvatar;
             if (pa == null) return;
+            if (pa != SemiFunc.PlayerAvatarLocal()) return; // local player only
             if (pa.transform.localScale.x > 0.99f) return; // not shrunk — leave vanilla CCD alone
 
             ApplyCcd(__instance);
@@ -659,6 +663,7 @@ namespace MiniEepo
         internal static void ApplyToAvatarTumble(PlayerAvatar pa)
         {
             if (pa == null) return;
+            if (pa != SemiFunc.PlayerAvatarLocal()) return; // local player only
             var tumble = pa.GetComponentInChildren<PlayerTumble>(includeInactive: true);
             if (tumble != null) ApplyCcd(tumble);
         }
@@ -668,11 +673,8 @@ namespace MiniEepo
             if (!_ccdApplied.Add(tumble.GetInstanceID())) return;
             foreach (var rb in tumble.GetComponentsInChildren<Rigidbody>(includeInactive: true))
             {
-                // ContinuousDynamic catches collisions vs both static and dynamic CCD-enabled
-                // colliders. Continuous (without Dynamic) only sweeps vs static — fine for floors,
-                // misses moving platforms.
-                if (rb.collisionDetectionMode != CollisionDetectionMode.ContinuousDynamic)
-                    rb.collisionDetectionMode = CollisionDetectionMode.ContinuousDynamic;
+                if (rb.collisionDetectionMode != CollisionDetectionMode.Continuous)
+                    rb.collisionDetectionMode = CollisionDetectionMode.Continuous;
             }
         }
     }
