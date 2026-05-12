@@ -1,5 +1,9 @@
 # MiniEepo
 
+> ## 📦 This repo is archived.
+> **MiniEepo has moved to the [REPOsitory monorepo](https://github.com/darkharasho/REPOsitory/tree/main/mods/mini-eepo).**
+> All future development, issues, and releases live there.
+
 A R.E.P.O. mod that shrinks all players, items, and valuables to 40% of their original size. Everyone starts the round tiny.
 
 ## Features
